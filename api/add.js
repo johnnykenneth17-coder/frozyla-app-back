@@ -1,509 +1,486 @@
 // ============================================
-// SUPPORT SYSTEM ROUTES
+// COMPLETE STAFF MANAGEMENT ROUTES
 // ============================================
 
-// ===== USER SUPPORT ROUTES =====
-
-// Create a new support ticket
-app.post("/api/support/tickets", authMiddleware, async (req, res) => {
-  try {
-    const { subject, message } = req.body;
-
-    if (!subject || !message) {
-      return res.status(400).json({
-        success: false,
-        message: "Subject and message are required"
-      });
-    }
-
-    // Create ticket
-    const ticketId = uuidv4();
-    const { data: ticket, error: ticketError } = await supabase
-      .from("support_tickets")
-      .insert([{
-        id: ticketId,
-        user_id: req.userId,
-        subject: subject,
-        status: "open",
-        priority: "normal",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      }])
-      .select()
-      .single();
-
-    if (ticketError) throw ticketError;
-
-    // Create initial message
-    const { error: messageError } = await supabase
-      .from("support_messages")
-      .insert([{
-        ticket_id: ticketId,
-        sender_id: req.userId,
-        sender_type: "user",
-        message: message,
-        is_read: false,
-        created_at: new Date().toISOString()
-      }]);
-
-    if (messageError) throw messageError;
-
-    res.status(201).json({
-      success: true,
-      message: "Support ticket created",
-      ticket: ticket
-    });
-  } catch (error) {
-    console.error("Create ticket error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to create support ticket"
-    });
-  }
-});
-
-// Get user's support tickets
-app.get("/api/support/tickets", authMiddleware, async (req, res) => {
+// Get all staff members (users with staff roles)
+app.get("/api/admin/staff", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase
-      .from("support_tickets")
-      .select(`
-        *,
-        messages:support_messages(
-          id,
-          message,
-          sender_type,
-          created_at,
-          is_read
-        )
-      `)
-      .eq("user_id", req.userId)
+      .from("users")
+      .select("id, email, name, role, phone, created_at, updated_at, last_login, status, delivery_instructions")
+      .in("role", ["admin", "manager", "staff", "chef", "delivery", "support"])
       .order("created_at", { ascending: false });
 
     if (error) throw error;
 
-    res.json({
-      success: true,
-      tickets: data || []
-    });
-  } catch (error) {
-    console.error("Get tickets error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch tickets"
-    });
-  }
-});
+    // Get staff statistics
+    const staffWithStats = await Promise.all((data || []).map(async (staff) => {
+      // Count orders handled by this staff
+      const { count: orderCount, error: orderError } = await supabase
+        .from("orders")
+        .select("*", { count: 'exact', head: true })
+        .eq("assigned_staff_id", staff.id);
 
-// Get a single ticket with all messages
-app.get("/api/support/tickets/:id", authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
+      if (orderError) console.error('Order count error:', orderError);
 
-    // Get ticket
-    const { data: ticket, error: ticketError } = await supabase
-      .from("support_tickets")
-      .select("*")
-      .eq("id", id)
-      .eq("user_id", req.userId)
-      .single();
+      // Get last active time
+      const lastActive = staff.last_login || staff.updated_at || staff.created_at;
 
-    if (ticketError || !ticket) {
-      return res.status(404).json({
-        success: false,
-        message: "Ticket not found"
-      });
-    }
-
-    // Get messages
-    const { data: messages, error: messagesError } = await supabase
-      .from("support_messages")
-      .select(`
-        *,
-        sender:users!sender_id(name, email)
-      `)
-      .eq("ticket_id", id)
-      .order("created_at", { ascending: true });
-
-    if (messagesError) throw messagesError;
-
-    // Mark messages as read
-    await supabase
-      .from("support_messages")
-      .update({ 
-        is_read: true, 
-        read_at: new Date().toISOString() 
-      })
-      .eq("ticket_id", id)
-      .eq("sender_type", "admin")
-      .eq("is_read", false);
-
-    res.json({
-      success: true,
-      ticket: ticket,
-      messages: messages || []
-    });
-  } catch (error) {
-    console.error("Get ticket error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch ticket"
-    });
-  }
-});
-
-// Send a message to a ticket
-app.post("/api/support/tickets/:id/messages", authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { message } = req.body;
-
-    if (!message) {
-      return res.status(400).json({
-        success: false,
-        message: "Message is required"
-      });
-    }
-
-    // Verify ticket belongs to user
-    const { data: ticket, error: ticketError } = await supabase
-      .from("support_tickets")
-      .select("id, status")
-      .eq("id", id)
-      .eq("user_id", req.userId)
-      .single();
-
-    if (ticketError || !ticket) {
-      return res.status(404).json({
-        success: false,
-        message: "Ticket not found"
-      });
-    }
-
-    if (ticket.status === "closed") {
-      return res.status(400).json({
-        success: false,
-        message: "This ticket is closed"
-      });
-    }
-
-    // If ticket is resolved, reopen it
-    let statusUpdate = {};
-    if (ticket.status === "resolved") {
-      statusUpdate.status = "in_progress";
-    }
-
-    // Create message
-    const { data: newMessage, error: messageError } = await supabase
-      .from("support_messages")
-      .insert([{
-        ticket_id: id,
-        sender_id: req.userId,
-        sender_type: "user",
-        message: message,
-        is_read: false,
-        created_at: new Date().toISOString()
-      }])
-      .select()
-      .single();
-
-    if (messageError) throw messageError;
-
-    // Update ticket
-    await supabase
-      .from("support_tickets")
-      .update({
-        status: statusUpdate.status || ticket.status,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id);
-
-    res.status(201).json({
-      success: true,
-      message: "Message sent",
-      data: newMessage
-    });
-  } catch (error) {
-    console.error("Send message error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to send message"
-    });
-  }
-});
-
-// ===== ADMIN SUPPORT ROUTES =====
-
-// Get all tickets (admin only)
-app.get("/api/admin/support/tickets", authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    const { status, priority } = req.query;
-    
-    let query = supabase
-      .from("support_tickets")
-      .select(`
-        *,
-        user:users!user_id(name, email),
-        messages:support_messages(
-          id,
-          message,
-          sender_type,
-          created_at,
-          is_read
-        )
-      `)
-      .order("created_at", { ascending: false });
-
-    if (status && status !== "all") {
-      query = query.eq("status", status);
-    }
-
-    if (priority && priority !== "all") {
-      query = query.eq("priority", priority);
-    }
-
-    const { data, error } = await query;
-
-    if (error) throw error;
-
-    // Count unread messages for each ticket
-    const ticketsWithUnread = (data || []).map(ticket => {
-      const unreadCount = (ticket.messages || []).filter(
-        m => !m.is_read && m.sender_type === "user"
-      ).length;
       return {
-        ...ticket,
-        unread_count: unreadCount
+        ...staff,
+        order_count: orderCount || 0,
+        last_active: lastActive
       };
-    });
+    }));
 
     res.json({
       success: true,
-      tickets: ticketsWithUnread
+      staff: staffWithStats
     });
   } catch (error) {
-    console.error("Admin get tickets error:", error);
+    console.error("Get staff error:", error);
     res.status(500).json({
       success: false,
-      message: "Failed to fetch tickets"
+      message: "Failed to fetch staff"
     });
   }
 });
 
-// Get a single ticket for admin
-app.get("/api/admin/support/tickets/:id", authMiddleware, adminMiddleware, async (req, res) => {
+// Get single staff member
+app.get("/api/admin/staff/:id", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-
-    const { data: ticket, error: ticketError } = await supabase
-      .from("support_tickets")
-      .select(`
-        *,
-        user:users!user_id(name, email),
-        messages:support_messages(
-          *,
-          sender:users!sender_id(name, email)
-        )
-      `)
-      .eq("id", id)
-      .single();
-
-    if (ticketError || !ticket) {
-      return res.status(404).json({
-        success: false,
-        message: "Ticket not found"
-      });
-    }
-
-    // Mark unread user messages as read
-    await supabase
-      .from("support_messages")
-      .update({ 
-        is_read: true, 
-        read_at: new Date().toISOString() 
-      })
-      .eq("ticket_id", id)
-      .eq("sender_type", "user")
-      .eq("is_read", false);
-
-    // Update ticket status if open
-    if (ticket.status === "open") {
-      await supabase
-        .from("support_tickets")
-        .update({ 
-          status: "in_progress",
-          updated_at: new Date().toISOString()
-        })
-        .eq("id", id);
-    }
-
-    res.json({
-      success: true,
-      ticket: ticket
-    });
-  } catch (error) {
-    console.error("Admin get ticket error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch ticket"
-    });
-  }
-});
-
-// Admin send message to ticket
-app.post("/api/admin/support/tickets/:id/messages", authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { message } = req.body;
-
-    if (!message) {
-      return res.status(400).json({
-        success: false,
-        message: "Message is required"
-      });
-    }
-
-    const { data: ticket, error: ticketError } = await supabase
-      .from("support_tickets")
-      .select("id, status")
-      .eq("id", id)
-      .single();
-
-    if (ticketError || !ticket) {
-      return res.status(404).json({
-        success: false,
-        message: "Ticket not found"
-      });
-    }
-
-    if (ticket.status === "closed") {
-      return res.status(400).json({
-        success: false,
-        message: "This ticket is closed"
-      });
-    }
-
-    // Create admin message
-    const { data: newMessage, error: messageError } = await supabase
-      .from("support_messages")
-      .insert([{
-        ticket_id: id,
-        sender_id: req.userId,
-        sender_type: "admin",
-        message: message,
-        is_read: false,
-        created_at: new Date().toISOString()
-      }])
-      .select()
-      .single();
-
-    if (messageError) throw messageError;
-
-    // Update ticket status to in_progress if not resolved
-    await supabase
-      .from("support_tickets")
-      .update({
-        status: ticket.status === "resolved" ? "in_progress" : ticket.status,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", id);
-
-    res.status(201).json({
-      success: true,
-      message: "Reply sent",
-      data: newMessage
-    });
-  } catch (error) {
-    console.error("Admin send message error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to send reply"
-    });
-  }
-});
-
-// Update ticket status (admin)
-app.patch("/api/admin/support/tickets/:id/status", authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status } = req.body;
-
-    const validStatuses = ["open", "in_progress", "resolved", "closed"];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid status"
-      });
-    }
-
-    const updateData = {
-      status: status,
-      updated_at: new Date().toISOString()
-    };
-
-    if (status === "resolved") {
-      updateData.resolved_at = new Date().toISOString();
-    }
-
-    if (status === "closed") {
-      updateData.closed_at = new Date().toISOString();
-    }
 
     const { data, error } = await supabase
-      .from("support_tickets")
-      .update(updateData)
+      .from("users")
+      .select("id, email, name, role, phone, created_at, updated_at, last_login, status, delivery_instructions")
       .eq("id", id)
-      .select()
       .single();
 
     if (error || !data) {
       return res.status(404).json({
         success: false,
-        message: "Ticket not found"
+        message: "Staff member not found"
+      });
+    }
+
+    // Get staff statistics
+    const { count: orderCount, error: orderError } = await supabase
+      .from("orders")
+      .select("*", { count: 'exact', head: true })
+      .eq("assigned_staff_id", id);
+
+    const { count: resolvedTickets, error: ticketError } = await supabase
+      .from("support_tickets")
+      .select("*", { count: 'exact', head: true })
+      .eq("assigned_to", id)
+      .eq("status", "resolved");
+
+    res.json({
+      success: true,
+      staff: {
+        ...data,
+        order_count: orderCount || 0,
+        resolved_tickets: resolvedTickets || 0
+      }
+    });
+  } catch (error) {
+    console.error("Get staff error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch staff"
+    });
+  }
+});
+
+// Create staff member (admin only)
+app.post("/api/admin/staff", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { email, password, name, role, phone, delivery_instructions } = req.body;
+
+    // Validate required fields
+    if (!email || !password || !name || !role) {
+      return res.status(400).json({
+        success: false,
+        message: "Email, password, name, and role are required"
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid email format"
+      });
+    }
+
+    // Validate password length
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 6 characters"
+      });
+    }
+
+    // Check if user exists
+    const { data: existing, error: checkError } = await supabase
+      .from("users")
+      .select("id")
+      .eq("email", email)
+      .single();
+
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: "User with this email already exists"
+      });
+    }
+
+    // Hash password
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    const userId = uuidv4();
+
+    // Create staff user
+    const { data, error } = await supabase
+      .from("users")
+      .insert([{
+        id: userId,
+        email: email.toLowerCase(),
+        password: hashedPassword,
+        name: name.trim(),
+        role: role,
+        phone: phone || null,
+        delivery_instructions: delivery_instructions || null,
+        status: 'active',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }])
+      .select("id, email, name, role, phone, created_at, status")
+      .single();
+
+    if (error) {
+      console.error("Create staff error:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Failed to create staff member: " + error.message
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: "Staff member created successfully",
+      staff: data
+    });
+  } catch (error) {
+    console.error("Create staff error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to create staff member"
+    });
+  }
+});
+
+// Update staff member
+app.put("/api/admin/staff/:id", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, role, phone, delivery_instructions, status } = req.body;
+
+    // Verify staff exists
+    const { data: existing, error: checkError } = await supabase
+      .from("users")
+      .select("id, role")
+      .eq("id", id)
+      .single();
+
+    if (checkError || !existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Staff member not found"
+      });
+    }
+
+    // Prevent changing own role to something lower
+    if (id === req.userId && role && role !== existing.role) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot change your own role"
+      });
+    }
+
+    const updateData = {
+      name: name || existing.name,
+      role: role || existing.role,
+      phone: phone || null,
+      delivery_instructions: delivery_instructions || null,
+      status: status || 'active',
+      updated_at: new Date().toISOString()
+    };
+
+    const { data, error } = await supabase
+      .from("users")
+      .update(updateData)
+      .eq("id", id)
+      .select("id, email, name, role, phone, created_at, updated_at, status")
+      .single();
+
+    if (error) {
+      console.error("Update staff error:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update staff member"
       });
     }
 
     res.json({
       success: true,
-      message: "Ticket status updated",
-      ticket: data
+      message: "Staff member updated successfully",
+      staff: data
     });
   } catch (error) {
-    console.error("Update ticket status error:", error);
+    console.error("Update staff error:", error);
     res.status(500).json({
       success: false,
-      message: "Failed to update ticket status"
+      message: "Failed to update staff member"
     });
   }
 });
 
-// Get ticket stats (admin)
-app.get("/api/admin/support/stats", authMiddleware, adminMiddleware, async (req, res) => {
+// Delete/Deactivate staff member (admin only)
+app.delete("/api/admin/staff/:id", authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { data: tickets, error } = await supabase
-      .from("support_tickets")
-      .select("status, priority");
+    const { id } = req.params;
 
-    if (error) throw error;
+    // Prevent deleting own account
+    if (id === req.userId) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot delete your own account"
+      });
+    }
 
-    const stats = {
-      total: tickets.length,
-      open: tickets.filter(t => t.status === "open").length,
-      in_progress: tickets.filter(t => t.status === "in_progress").length,
-      resolved: tickets.filter(t => t.status === "resolved").length,
-      closed: tickets.filter(t => t.status === "closed").length,
-      high_priority: tickets.filter(t => t.priority === "high" || t.priority === "urgent").length
-    };
+    // Check if staff exists
+    const { data: existing, error: checkError } = await supabase
+      .from("users")
+      .select("id, role")
+      .eq("id", id)
+      .single();
+
+    if (checkError || !existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Staff member not found"
+      });
+    }
+
+    // Soft delete - deactivate and demote to user
+    const { error } = await supabase
+      .from("users")
+      .update({
+        status: 'inactive',
+        role: 'user', // Demote to regular user
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", id);
+
+    if (error) {
+      console.error("Delete staff error:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Failed to deactivate staff member"
+      });
+    }
 
     res.json({
       success: true,
-      stats: stats
+      message: "Staff member deactivated successfully"
     });
   } catch (error) {
-    console.error("Get support stats error:", error);
+    console.error("Delete staff error:", error);
     res.status(500).json({
       success: false,
-      message: "Failed to fetch stats"
+      message: "Failed to deactivate staff member"
+    });
+  }
+});
+
+// Update staff role
+app.patch("/api/admin/staff/:id/role", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    const validRoles = ["admin", "manager", "staff", "chef", "delivery", "support"];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid role. Must be one of: " + validRoles.join(", ")
+      });
+    }
+
+    // Prevent changing own role
+    if (id === req.userId) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot change your own role"
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("users")
+      .update({
+        role: role,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", id)
+      .select("id, email, name, role")
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({
+        success: false,
+        message: "Staff member not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Staff role updated successfully",
+      staff: data
+    });
+  } catch (error) {
+    console.error("Update staff role error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update staff role"
+    });
+  }
+});
+
+// Update staff status (active/inactive/on_leave)
+app.patch("/api/admin/staff/:id/status", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!['active', 'inactive', 'on_leave'].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid status. Must be active, inactive, or on_leave"
+      });
+    }
+
+    // Prevent deactivating own account
+    if (id === req.userId && status !== 'active') {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot change your own status"
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("users")
+      .update({
+        status: status,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", id)
+      .select("id, email, name, role, status")
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({
+        success: false,
+        message: "Staff member not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Staff status updated to ${status}`,
+      staff: data
+    });
+  } catch (error) {
+    console.error("Update staff status error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update staff status"
+    });
+  }
+});
+
+// Get staff performance metrics
+app.get("/api/admin/staff/metrics", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { period = 'month' } = req.query;
+    
+    let dateFilter = new Date();
+    if (period === 'week') {
+      dateFilter.setDate(dateFilter.getDate() - 7);
+    } else if (period === 'month') {
+      dateFilter.setMonth(dateFilter.getMonth() - 1);
+    } else if (period === 'year') {
+      dateFilter.setFullYear(dateFilter.getFullYear() - 1);
+    }
+
+    // Get staff list
+    const { data: staff, error: staffError } = await supabase
+      .from("users")
+      .select("id, name, email, role, status")
+      .in("role", ["admin", "manager", "staff", "chef", "delivery", "support"]);
+
+    if (staffError) throw staffError;
+
+    // Get metrics for each staff member
+    const metrics = await Promise.all((staff || []).map(async (member) => {
+      // Orders handled
+      const { count: ordersHandled, error: orderError } = await supabase
+        .from("orders")
+        .select("*", { count: 'exact', head: true })
+        .eq("assigned_staff_id", member.id)
+        .gte("created_at", dateFilter.toISOString());
+
+      // Tickets resolved
+      const { count: ticketsResolved, error: ticketError } = await supabase
+        .from("support_tickets")
+        .select("*", { count: 'exact', head: true })
+        .eq("assigned_to", member.id)
+        .eq("status", "resolved")
+        .gte("resolved_at", dateFilter.toISOString());
+
+      return {
+        ...member,
+        orders_handled: ordersHandled || 0,
+        tickets_resolved: ticketsResolved || 0
+      };
+    }));
+
+    // Calculate totals
+    const totalStaff = metrics.length;
+    const activeStaff = metrics.filter(m => m.status === 'active').length;
+    const totalOrders = metrics.reduce((sum, m) => sum + (m.orders_handled || 0), 0);
+    const totalTickets = metrics.reduce((sum, m) => sum + (m.tickets_resolved || 0), 0);
+
+    res.json({
+      success: true,
+      metrics: {
+        staff: metrics,
+        summary: {
+          total_staff: totalStaff,
+          active_staff: activeStaff,
+          total_orders_handled: totalOrders,
+          total_tickets_resolved: totalTickets,
+          period: period
+        }
+      }
+    });
+  } catch (error) {
+    console.error("Get staff metrics error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch staff metrics"
     });
   }
 });
