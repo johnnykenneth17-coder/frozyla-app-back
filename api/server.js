@@ -790,6 +790,430 @@ app.get(
   },
 );
 
+// ============================================
+// ADDRESS MANAGEMENT ROUTES
+// ============================================
+
+// ===== USER ADDRESS ROUTES =====
+
+// Get all user addresses
+app.get("/api/addresses", authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("user_addresses")
+      .select("*")
+      .eq("user_id", req.userId)
+      .order("is_default", { ascending: false })
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      addresses: data || []
+    });
+  } catch (error) {
+    console.error("Get addresses error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch addresses"
+    });
+  }
+});
+
+// Add new address
+app.post("/api/addresses", authMiddleware, async (req, res) => {
+  try {
+    const { 
+      address_line1, 
+      address_line2, 
+      city, 
+      state, 
+      zip_code, 
+      country,
+      address_type,
+      is_default,
+      latitude,
+      longitude,
+      place_id,
+      formatted_address
+    } = req.body;
+
+    if (!address_line1 || !city || !state || !zip_code) {
+      return res.status(400).json({
+        success: false,
+        message: "Address line 1, city, state, and zip code are required"
+      });
+    }
+
+    // If this is set as default, unset other defaults
+    if (is_default) {
+      await supabase
+        .from("user_addresses")
+        .update({ is_default: false })
+        .eq("user_id", req.userId);
+    }
+
+    const { data, error } = await supabase
+      .from("user_addresses")
+      .insert([{
+        user_id: req.userId,
+        address_line1,
+        address_line2: address_line2 || null,
+        city,
+        state,
+        zip_code,
+        country: country || 'USA',
+        address_type: address_type || 'home',
+        is_default: is_default || false,
+        latitude: latitude || null,
+        longitude: longitude || null,
+        place_id: place_id || null,
+        formatted_address: formatted_address || null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.status(201).json({
+      success: true,
+      message: "Address added successfully",
+      address: data
+    });
+  } catch (error) {
+    console.error("Add address error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to add address"
+    });
+  }
+});
+
+// Update address
+app.put("/api/addresses/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { 
+      address_line1, 
+      address_line2, 
+      city, 
+      state, 
+      zip_code, 
+      country,
+      address_type,
+      is_default,
+      latitude,
+      longitude,
+      place_id,
+      formatted_address
+    } = req.body;
+
+    // Verify address belongs to user
+    const { data: existing, error: checkError } = await supabase
+      .from("user_addresses")
+      .select("id")
+      .eq("id", id)
+      .eq("user_id", req.userId)
+      .single();
+
+    if (checkError || !existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Address not found"
+      });
+    }
+
+    // If this is set as default, unset other defaults
+    if (is_default) {
+      await supabase
+        .from("user_addresses")
+        .update({ is_default: false })
+        .eq("user_id", req.userId)
+        .neq("id", id);
+    }
+
+    const updateData = {
+      address_line1,
+      address_line2: address_line2 || null,
+      city,
+      state,
+      zip_code,
+      country: country || 'USA',
+      address_type: address_type || 'home',
+      is_default: is_default || false,
+      latitude: latitude || null,
+      longitude: longitude || null,
+      place_id: place_id || null,
+      formatted_address: formatted_address || null,
+      updated_at: new Date().toISOString()
+    };
+
+    const { data, error } = await supabase
+      .from("user_addresses")
+      .update(updateData)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: "Address updated successfully",
+      address: data
+    });
+  } catch (error) {
+    console.error("Update address error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update address"
+    });
+  }
+});
+
+// Delete address
+app.delete("/api/addresses/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from("user_addresses")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", req.userId);
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: "Address deleted successfully"
+    });
+  } catch (error) {
+    console.error("Delete address error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete address"
+    });
+  }
+});
+
+// Set default address
+app.patch("/api/addresses/:id/default", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Verify address belongs to user
+    const { data: existing, error: checkError } = await supabase
+      .from("user_addresses")
+      .select("id")
+      .eq("id", id)
+      .eq("user_id", req.userId)
+      .single();
+
+    if (checkError || !existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Address not found"
+      });
+    }
+
+    // Unset all defaults
+    await supabase
+      .from("user_addresses")
+      .update({ is_default: false })
+      .eq("user_id", req.userId);
+
+    // Set this as default
+    const { data, error } = await supabase
+      .from("user_addresses")
+      .update({ 
+        is_default: true,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: "Default address updated",
+      address: data
+    });
+  } catch (error) {
+    console.error("Set default address error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to set default address"
+    });
+  }
+});
+
+// ===== ORDER DELIVERY ROUTES =====
+
+// Update order with delivery details
+app.patch("/api/orders/:id/delivery", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { 
+      delivery_phone,
+      delivery_instructions,
+      delivery_address,
+      delivery_latitude,
+      delivery_longitude,
+      delivery_place_id,
+      delivery_formatted_address
+    } = req.body;
+
+    // Verify order belongs to user
+    const { data: order, error: checkError } = await supabase
+      .from("orders")
+      .select("id")
+      .eq("id", id)
+      .eq("user_id", req.userId)
+      .single();
+
+    if (checkError || !order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found"
+      });
+    }
+
+    const updateData = {
+      delivery_phone: delivery_phone || null,
+      delivery_instructions: delivery_instructions || null,
+      delivery_address: delivery_address || null,
+      delivery_latitude: delivery_latitude || null,
+      delivery_longitude: delivery_longitude || null,
+      delivery_place_id: delivery_place_id || null,
+      delivery_formatted_address: delivery_formatted_address || null,
+      updated_at: new Date().toISOString()
+    };
+
+    const { data, error } = await supabase
+      .from("orders")
+      .update(updateData)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: "Delivery details updated",
+      order: data
+    });
+  } catch (error) {
+    console.error("Update delivery error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update delivery details"
+    });
+  }
+});
+
+// Update delivery status (admin only)
+app.patch("/api/admin/orders/:id/delivery-status", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { delivery_status, tracking_id } = req.body;
+
+    const validStatuses = ['pending', 'preparing', 'ready', 'out_for_delivery', 'delivered', 'failed'];
+    if (!validStatuses.includes(delivery_status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid delivery status"
+      });
+    }
+
+    const updateData = {
+      delivery_status,
+      updated_at: new Date().toISOString()
+    };
+
+    if (delivery_status === 'out_for_delivery') {
+      updateData.estimated_delivery_time = new Date(Date.now() + 30 * 60000); // 30 minutes from now
+    }
+
+    if (delivery_status === 'delivered') {
+      updateData.actual_delivery_time = new Date().toISOString();
+    }
+
+    if (tracking_id) {
+      updateData.delivery_tracking_id = tracking_id;
+    }
+
+    const { data, error } = await supabase
+      .from("orders")
+      .update(updateData)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Delivery status updated",
+      order: data
+    });
+  } catch (error) {
+    console.error("Update delivery status error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update delivery status"
+    });
+  }
+});
+
+// Get delivery tracking info
+app.get("/api/orders/:id/track", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    let query = supabase
+      .from("orders")
+      .select("id, delivery_status, delivery_address, delivery_formatted_address, delivery_latitude, delivery_longitude, estimated_delivery_time, actual_delivery_time, delivery_tracking_id, status, created_at, total")
+      .eq("id", id);
+
+    // Non-admin users can only see their own orders
+    if (req.userRole !== 'admin') {
+      query = query.eq("user_id", req.userId);
+    }
+
+    const { data, error } = await query.single();
+
+    if (error || !data) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      tracking: data
+    });
+  } catch (error) {
+    console.error("Track order error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to get tracking info"
+    });
+  }
+});
+
 // ===== ADMIN MENU ROUTES =====
 app.post(
   "/api/admin/menu",
