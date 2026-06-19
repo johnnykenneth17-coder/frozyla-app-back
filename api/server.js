@@ -441,6 +441,42 @@ app.delete(
   },
 );
 
+// ===== ADMIN USER DETAILS ROUTE =====
+app.get(
+  "/api/admin/users/:id",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      const { data, error } = await supabase
+        .from("users")
+        .select("id, email, name, role, phone, created_at, last_login")
+        .eq("id", id)
+        .single();
+
+      if (error || !data) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found"
+        });
+      }
+
+      res.json({
+        success: true,
+        user: data
+      });
+    } catch (error) {
+      console.error("Admin user details error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch user details"
+      });
+    }
+  }
+);
+
 // ===== ORDERS ROUTES =====
 app.post("/api/orders", authMiddleware, async (req, res) => {
   try {
