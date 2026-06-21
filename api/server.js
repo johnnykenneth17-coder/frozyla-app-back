@@ -4870,6 +4870,129 @@ app.get(
   },
 );
 
+// server.js - Add this endpoint
+
+// Get single ledger entry with line items (admin only)
+app.get(
+  "/api/admin/ledger/entry/:id",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      // Get the entry from ledger_entries table
+      const { data: entry, error: entryError } = await supabase
+        .from("ledger_entries")
+        .select(
+          `
+          *,
+          created_by_user:users!ledger_entries_created_by_fkey(
+            id, 
+            name, 
+            email
+          ),
+          posted_by_user:users!ledger_entries_posted_by_fkey(
+            id, 
+            name, 
+            email
+          )
+        `,
+        )
+        .eq("id", id)
+        .single();
+
+      if (entryError || !entry) {
+        console.error("Entry fetch error:", entryError);
+        return res.status(404).json({
+          success: false,
+          message: "Ledger entry not found",
+        });
+      }
+
+      // Get line items for this entry
+      const { data: lineItems, error: lineError } = await supabase
+        .from("ledger_line_items")
+        .select(
+          `
+          *,
+          account:ledger_accounts(
+            id,
+            account_code,
+            account_name,
+            account_type
+          ),
+          user:users!ledger_line_items_user_id_fkey(
+            id,
+            name,
+            email,
+            account_number
+          )
+        `,
+        )
+        .eq("entry_id", id)
+        .order("created_at", { ascending: true });
+
+      if (lineError) {
+        console.error("Line items fetch error:", lineError);
+        // Don't fail the whole request, just return empty line items
+      }
+
+      // Format the response
+      const formattedEntry = {
+        id: entry.id,
+        entry_number: entry.entry_number,
+        transaction_date: entry.transaction_date,
+        description: entry.description,
+        reference_type: entry.reference_type,
+        reference_id: entry.reference_id,
+        created_at: entry.created_at,
+        created_by: entry.created_by,
+        created_by_name: entry.created_by_user?.name,
+        posted_at: entry.posted_at,
+        posted_by: entry.posted_by,
+        posted_by_name: entry.posted_by_user?.name,
+        is_posted: entry.is_posted,
+        notes: entry.notes,
+        line_items: (lineItems || []).map((item) => ({
+          id: item.id,
+          account_id: item.account_id,
+          account_code: item.account?.account_code,
+          account_name: item.account?.account_name,
+          account_type: item.account?.account_type,
+          user_id: item.user_id,
+          user: item.user
+            ? {
+                id: item.user.id,
+                name: item.user.name,
+                email: item.user.email,
+                account_number: item.user.account_number,
+              }
+            : null,
+          debit_amount: parseFloat(item.debit_amount || 0),
+          credit_amount: parseFloat(item.credit_amount || 0),
+          balance_before: parseFloat(item.balance_before || 0),
+          balance_after: parseFloat(item.balance_after || 0),
+          description: item.description,
+          created_at: item.created_at,
+        })),
+      };
+
+      res.json({
+        success: true,
+        entry: formattedEntry,
+      });
+    } catch (error) {
+      console.error("Get ledger entry error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch ledger entry",
+        error: error.message,
+      });
+    }
+  },
+);
+
 // server.js - Add GET /api/admin/ledger/balance/:userId
 
 // Get account balance for a specific user (admin only)
@@ -5177,11 +5300,12 @@ app.get(
   async (req, res) => {
     try {
       const { status } = req.query;
-      
+
       // Build the query using the new ledger_reconciliation table
       let query = supabase
         .from("ledger_reconciliation")
-        .select(`
+        .select(
+          `
           *,
           user:users!ledger_reconciliation_user_id_fkey(
             id, 
@@ -5195,7 +5319,8 @@ app.get(
             name, 
             email
           )
-        `)
+        `,
+        )
         .order("created_at", { ascending: false });
 
       // Apply status filter
@@ -5250,7 +5375,6 @@ app.get(
         discrepancies: formattedDiscrepancies,
         total: formattedDiscrepancies.length,
       });
-
     } catch (error) {
       console.error("Ledger discrepancies error:", error);
       res.status(500).json({
