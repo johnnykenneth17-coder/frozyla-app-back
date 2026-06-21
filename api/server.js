@@ -81,7 +81,8 @@ app.options("*", cors());
   message: "Too many requests from this IP, please try again later.",
 });*/
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  //windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 60 * 1000,
   max: 500, // 100 requests per 15 minutes
   message: {
     success: false,
