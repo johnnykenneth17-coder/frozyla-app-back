@@ -3927,7 +3927,7 @@ app.patch(
 );
 
 // Get all users with balance info (admin)
-app.get(
+/*app.get(
   "/api/admin/users/balances",
   authMiddleware,
   adminMiddleware,
@@ -3979,6 +3979,168 @@ app.get(
       });
     }
   },
+);*/
+
+// server.js - Fixed GET /api/admin/users/balances
+
+// Get all users with balance info (admin)
+app.get(
+    "/api/admin/users/balances",
+    authMiddleware,
+    adminMiddleware,
+    async (req, res) => {
+        try {
+            const { search, status, limit = 50, offset = 0 } = req.query;
+
+            // Build the query
+            let query = supabase
+                .from("users")
+                .select(
+                    "id, name, email, account_number, balance, account_status, role, created_at, last_login"
+                )
+                .order("created_at", { ascending: false });
+
+            // Apply filters
+            if (search) {
+                query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%,account_number.ilike.%${search}%`);
+            }
+
+            if (status) {
+                query = query.eq("account_status", status);
+            }
+
+            // Apply pagination
+            const from = parseInt(offset);
+            const to = from + parseInt(limit) - 1;
+            query = query.range(from, to);
+
+            const { data: users, error } = await query;
+
+            if (error) {
+                console.error("Users fetch error:", error);
+                return res.status(500).json({
+                    success: false,
+                    message: "Failed to fetch users",
+                    error: error.message,
+                });
+            }
+
+            // Get transaction summary for each user
+            const usersWithStats = await Promise.all(
+                (users || []).map(async (user) => {
+                    // Get total spent
+                    const { data: spentData } = await supabase
+                        .from("wallet_transactions")
+                        .select("amount")
+                        .eq("user_id", user.id)
+                        .eq("transaction_type", "debit")
+                        .eq("status", "completed");
+
+                    const totalSpent = spentData 
+                        ? spentData.reduce((sum, tx) => sum + parseFloat(tx.amount), 0)
+                        : 0;
+
+                    // Get total credited
+                    const { data: creditedData } = await supabase
+                        .from("wallet_transactions")
+                        .select("amount")
+                        .eq("user_id", user.id)
+                        .eq("transaction_type", "credit")
+                        .eq("status", "completed");
+
+                    const totalCredited = creditedData
+                        ? creditedData.reduce((sum, tx) => sum + parseFloat(tx.amount), 0)
+                        : 0;
+
+                    // Get order count
+                    const { count: ordersCount } = await supabase
+                        .from("orders")
+                        .select("*", { count: "exact", head: true })
+                        .eq("user_id", user.id);
+
+                    // Get latest ledger entry
+                    const { data: latestLedger } = await supabase
+                        .from("account_ledger")
+                        .select("ledger_balance, status, created_at")
+                        .eq("user_id", user.id)
+                        .order("created_at", { ascending: false })
+                        .limit(1);
+
+                    return {
+                        ...user,
+                        balance: parseFloat(user.balance),
+                        total_spent: totalSpent,
+                        total_credited: totalCredited,
+                        total_orders: ordersCount || 0,
+                        ledger: latestLedger && latestLedger.length > 0 ? {
+                            ledger_balance: parseFloat(latestLedger[0].ledger_balance),
+                            status: latestLedger[0].status,
+                            updated_at: latestLedger[0].created_at,
+                        } : null,
+                    };
+                })
+            );
+
+            // Get total count
+            let countQuery = supabase
+                .from("users")
+                .select("*", { count: "exact", head: true });
+
+            if (search) {
+                countQuery = countQuery.or(`name.ilike.%${search}%,email.ilike.%${search}%,account_number.ilike.%${search}%`);
+            }
+
+            if (status) {
+                countQuery = countQuery.eq("account_status", status);
+            }
+
+            const { count, error: countError } = await countQuery;
+
+            if (countError) {
+                console.error("Count error:", countError);
+            }
+
+            // Get summary statistics
+            const { data: summaryData } = await supabase
+                .from("users")
+                .select("balance, account_status");
+
+            let summary = {
+                total_users: count || 0,
+                total_balance: 0,
+                active_users: 0,
+                suspended_users: 0,
+            };
+
+            if (summaryData) {
+                summaryData.forEach(user => {
+                    summary.total_balance += parseFloat(user.balance || 0);
+                    if (user.account_status === "active") {
+                        summary.active_users += 1;
+                    } else if (user.account_status === "suspended") {
+                        summary.suspended_users += 1;
+                    }
+                });
+            }
+
+            res.json({
+                success: true,
+                users: usersWithStats,
+                total: count || 0,
+                limit: parseInt(limit),
+                offset: parseInt(offset),
+                summary: summary,
+            });
+
+        } catch (error) {
+            console.error("Get users balances error:", error);
+            res.status(500).json({
+                success: false,
+                message: "Failed to fetch users",
+                error: error.message,
+            });
+        }
+    },
 );
 
 // Get account ledger discrepancies (admin)
@@ -4014,6 +4176,371 @@ app.get(
     }
   },
 );*/
+
+// server.js - Add GET /api/admin/ledger
+
+// Get all ledger entries (admin only)
+app.get(
+    "/api/admin/ledger",
+    authMiddleware,
+    adminMiddleware,
+    async (req, res) => {
+        try {
+            const { 
+                limit = 50, 
+                offset = 0, 
+                status,
+                user_id,
+                start_date,
+                end_date 
+            } = req.query;
+
+            // Build the query
+            let query = supabase
+                .from("account_ledger")
+                .select(`
+                    *,
+                    user:users!account_ledger_user_id_fkey(
+                        id,
+                        name,
+                        email,
+                        account_number,
+                        balance,
+                        created_at as user_joined_at
+                    )
+                `)
+                .order("created_at", { ascending: false });
+
+            // Apply filters
+            if (status) {
+                query = query.eq("status", status);
+            }
+
+            if (user_id) {
+                query = query.eq("user_id", user_id);
+            }
+
+            if (start_date) {
+                query = query.gte("created_at", start_date);
+            }
+
+            if (end_date) {
+                query = query.lte("created_at", end_date);
+            }
+
+            // Apply pagination
+            const from = parseInt(offset);
+            const to = from + parseInt(limit) - 1;
+            query = query.range(from, to);
+
+            const { data: ledgerEntries, error } = await query;
+
+            if (error) {
+                console.error("Admin ledger fetch error:", error);
+                return res.status(500).json({
+                    success: false,
+                    message: "Failed to fetch ledger entries",
+                    error: error.message,
+                });
+            }
+
+            // Get total count
+            let countQuery = supabase
+                .from("account_ledger")
+                .select("*", { count: "exact", head: true });
+
+            if (status) {
+                countQuery = countQuery.eq("status", status);
+            }
+
+            if (user_id) {
+                countQuery = countQuery.eq("user_id", user_id);
+            }
+
+            if (start_date) {
+                countQuery = countQuery.gte("created_at", start_date);
+            }
+
+            if (end_date) {
+                countQuery = countQuery.lte("created_at", end_date);
+            }
+
+            const { count, error: countError } = await countQuery;
+
+            if (countError) {
+                console.error("Count error:", countError);
+            }
+
+            // Get summary statistics
+            const { data: summaryData, error: summaryError } = await supabase
+                .from("account_ledger")
+                .select("status, difference")
+                .eq("status", "flagged");
+
+            let summary = {
+                total_entries: count || 0,
+                total_flagged: 0,
+                total_matched: 0,
+                total_discrepancy: 0,
+            };
+
+            if (!summaryError && summaryData) {
+                summary.total_flagged = summaryData.filter(s => s.status === "flagged").length;
+                summary.total_matched = summaryData.filter(s => s.status === "matched").length;
+                
+                // Calculate total discrepancy amount
+                const flaggedEntries = summaryData.filter(s => s.status === "flagged");
+                summary.total_discrepancy = flaggedEntries.reduce(
+                    (sum, s) => sum + Math.abs(parseFloat(s.difference || 0)),
+                    0
+                );
+            }
+
+            // Format the response
+            const formattedEntries = (ledgerEntries || []).map(entry => ({
+                id: entry.id,
+                user_id: entry.user_id,
+                user: entry.user ? {
+                    id: entry.user.id,
+                    name: entry.user.name,
+                    email: entry.user.email,
+                    account_number: entry.user.account_number,
+                    balance: parseFloat(entry.user.balance),
+                    joined_at: entry.user.user_joined_at,
+                } : null,
+                ledger_balance: parseFloat(entry.ledger_balance),
+                actual_balance: parseFloat(entry.actual_balance),
+                difference: parseFloat(entry.difference),
+                status: entry.status,
+                flagged_reason: entry.flagged_reason,
+                resolved_at: entry.resolved_at,
+                created_at: entry.created_at,
+                updated_at: entry.updated_at,
+            }));
+
+            res.json({
+                success: true,
+                ledger: formattedEntries,
+                total: count || 0,
+                limit: parseInt(limit),
+                offset: parseInt(offset),
+                summary: summary,
+            });
+
+        } catch (error) {
+            console.error("Admin ledger error:", error);
+            res.status(500).json({
+                success: false,
+                message: "Failed to fetch ledger entries",
+                error: error.message,
+            });
+        }
+    },
+);
+
+// server.js - Add GET /api/admin/transactions
+
+// Get all transactions (admin only)
+app.get(
+    "/api/admin/transactions",
+    authMiddleware,
+    adminMiddleware,
+    async (req, res) => {
+        try {
+            const { 
+                limit = 50, 
+                offset = 0, 
+                type, 
+                status,
+                user_id,
+                start_date, 
+                end_date,
+                search 
+            } = req.query;
+
+            // Build the query
+            let query = supabase
+                .from("wallet_transactions")
+                .select(`
+                    *,
+                    user:users!wallet_transactions_user_id_fkey(
+                        id,
+                        name,
+                        email,
+                        account_number
+                    ),
+                    order:orders!wallet_transactions_order_id_fkey(
+                        id,
+                        status,
+                        total,
+                        created_at
+                    ),
+                    funding_request:card_funding_requests(
+                        id,
+                        amount,
+                        status,
+                        requested_at
+                    )
+                `)
+                .order("created_at", { ascending: false });
+
+            // Apply filters
+            if (type) {
+                query = query.eq("transaction_type", type);
+            }
+
+            if (status) {
+                query = query.eq("status", status);
+            }
+
+            if (user_id) {
+                query = query.eq("user_id", user_id);
+            }
+
+            if (start_date) {
+                query = query.gte("created_at", start_date);
+            }
+
+            if (end_date) {
+                query = query.lte("created_at", end_date);
+            }
+
+            // Search by reference or description
+            if (search) {
+                query = query.or(`reference.ilike.%${search}%,description.ilike.%${search}%`);
+            }
+
+            // Apply pagination
+            const from = parseInt(offset);
+            const to = from + parseInt(limit) - 1;
+            query = query.range(from, to);
+
+            const { data: transactions, error } = await query;
+
+            if (error) {
+                console.error("Admin transactions fetch error:", error);
+                return res.status(500).json({
+                    success: false,
+                    message: "Failed to fetch transactions",
+                    error: error.message,
+                });
+            }
+
+            // Get total count for pagination
+            let countQuery = supabase
+                .from("wallet_transactions")
+                .select("*", { count: "exact", head: true });
+
+            if (type) {
+                countQuery = countQuery.eq("transaction_type", type);
+            }
+
+            if (status) {
+                countQuery = countQuery.eq("status", status);
+            }
+
+            if (user_id) {
+                countQuery = countQuery.eq("user_id", user_id);
+            }
+
+            if (start_date) {
+                countQuery = countQuery.gte("created_at", start_date);
+            }
+
+            if (end_date) {
+                countQuery = countQuery.lte("created_at", end_date);
+            }
+
+            if (search) {
+                countQuery = countQuery.or(`reference.ilike.%${search}%,description.ilike.%${search}%`);
+            }
+
+            const { count, error: countError } = await countQuery;
+
+            if (countError) {
+                console.error("Count error:", countError);
+            }
+
+            // Get summary statistics
+            const { data: summaryData, error: summaryError } = await supabase
+                .from("wallet_transactions")
+                .select("transaction_type, amount, status")
+                .eq("status", "completed");
+
+            let summary = {
+                total_credit: 0,
+                total_debit: 0,
+                total_volume: 0,
+                total_transactions: count || 0,
+            };
+
+            if (!summaryError && summaryData) {
+                summaryData.forEach(tx => {
+                    const amount = parseFloat(tx.amount);
+                    summary.total_volume += amount;
+                    if (tx.transaction_type === "credit") {
+                        summary.total_credit += amount;
+                    } else if (tx.transaction_type === "debit") {
+                        summary.total_debit += amount;
+                    }
+                });
+            }
+
+            // Format the response
+            const formattedTransactions = (transactions || []).map(tx => ({
+                id: tx.id,
+                user_id: tx.user_id,
+                user: tx.user ? {
+                    id: tx.user.id,
+                    name: tx.user.name,
+                    email: tx.user.email,
+                    account_number: tx.user.account_number,
+                } : null,
+                transaction_type: tx.transaction_type,
+                amount: parseFloat(tx.amount),
+                balance_before: parseFloat(tx.balance_before),
+                balance_after: parseFloat(tx.balance_after),
+                reference: tx.reference,
+                description: tx.description,
+                category: tx.category,
+                order_id: tx.order_id,
+                order: tx.order ? {
+                    id: tx.order.id,
+                    status: tx.order.status,
+                    total: parseFloat(tx.order.total),
+                    created_at: tx.order.created_at,
+                } : null,
+                funding_request_id: tx.funding_request_id,
+                funding_request: tx.funding_request ? {
+                    id: tx.funding_request.id,
+                    amount: parseFloat(tx.funding_request.amount),
+                    status: tx.funding_request.status,
+                    requested_at: tx.funding_request.requested_at,
+                } : null,
+                status: tx.status,
+                created_at: tx.created_at,
+                completed_at: tx.completed_at,
+            }));
+
+            res.json({
+                success: true,
+                transactions: formattedTransactions,
+                total: count || 0,
+                limit: parseInt(limit),
+                offset: parseInt(offset),
+                summary: summary,
+            });
+
+        } catch (error) {
+            console.error("Admin transactions error:", error);
+            res.status(500).json({
+                success: false,
+                message: "Failed to fetch transactions",
+                error: error.message,
+            });
+        }
+    },
+);
 
 // server.js - Fixed GET /api/admin/ledger/discrepancies
 
