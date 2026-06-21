@@ -5167,29 +5167,43 @@ app.get(
 // server.js - Fixed GET /api/admin/ledger/discrepancies
 
 // Get account ledger discrepancies (admin)
+// server.js - Replace the entire /api/admin/ledger/discrepancies endpoint with this
+
+// Get ledger discrepancies (admin only)
 app.get(
   "/api/admin/ledger/discrepancies",
   authMiddleware,
   adminMiddleware,
   async (req, res) => {
     try {
-      // Get all flagged discrepancies
-      const { data: discrepancies, error } = await supabase
-        .from("account_ledger")
-        .select(
-          `
-                    *,
-                    user:users!account_ledger_user_id_fkey(
-                        id, 
-                        name, 
-                        email, 
-                        account_number, 
-                        balance
-                    )
-                `,
-        )
-        .eq("status", "flagged")
+      const { status } = req.query;
+      
+      // Build the query using the new ledger_reconciliation table
+      let query = supabase
+        .from("ledger_reconciliation")
+        .select(`
+          *,
+          user:users!ledger_reconciliation_user_id_fkey(
+            id, 
+            name, 
+            email, 
+            account_number, 
+            balance
+          ),
+          resolved_by_user:users!ledger_reconciliation_resolved_by_fkey(
+            id, 
+            name, 
+            email
+          )
+        `)
         .order("created_at", { ascending: false });
+
+      // Apply status filter
+      if (status && status !== "all") {
+        query = query.eq("status", status);
+      }
+
+      const { data: discrepancies, error } = await query;
 
       if (error) {
         console.error("Ledger discrepancies error:", error);
@@ -5219,32 +5233,24 @@ app.get(
         status: entry.status,
         flagged_reason: entry.flagged_reason,
         resolved_at: entry.resolved_at,
+        resolved_by: entry.resolved_by_user
+          ? {
+              id: entry.resolved_by_user.id,
+              name: entry.resolved_by_user.name,
+              email: entry.resolved_by_user.email,
+            }
+          : null,
+        resolution_notes: entry.resolution_notes,
         created_at: entry.created_at,
         updated_at: entry.updated_at,
       }));
-
-      // Also get recent ledger entries for each user
-      const usersWithLedger = await Promise.all(
-        (discrepancies || []).map(async (entry) => {
-          const { data: recentEntries } = await supabase
-            .from("account_ledger")
-            .select("ledger_balance, actual_balance, status, created_at")
-            .eq("user_id", entry.user_id)
-            .order("created_at", { ascending: false })
-            .limit(5);
-
-          return {
-            ...entry,
-            recent_entries: recentEntries || [],
-          };
-        }),
-      );
 
       res.json({
         success: true,
         discrepancies: formattedDiscrepancies,
         total: formattedDiscrepancies.length,
       });
+
     } catch (error) {
       console.error("Ledger discrepancies error:", error);
       res.status(500).json({
