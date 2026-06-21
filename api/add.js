@@ -1,77 +1,109 @@
-// server.js - Update the generateAccountNumber function
+// server.js - Replace the admin funding requests endpoint
 
-function generateAccountNumber() {
-    // Generate a 10-digit number only (no letters)
-    let accountNumber = '';
-    for (let i = 0; i < 10; i++) {
-        accountNumber += Math.floor(Math.random() * 10);
-    }
-    return accountNumber;
-}
-
-// Also update the user creation to use this function
-// In signupUser function, add account number generation:
-const accountNumber = generateAccountNumber();
-
-// Update the users table insert to include account_number
-const { data: user, error: createError } = await supabase
-    .from("users")
-    .insert([
-        {
-            id: userId,
-            email: sanitizedEmail,
-            password: hashedPassword,
-            name: sanitizedName,
-            role: "user",
-            account_number: accountNumber, // Add this line
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-        },
-    ])
-    .select("id, email, name, role, account_number, created_at")
-    .single();
-
-
-
-
-    // server.js - Update get wallet balance endpoint
-app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
+// Get all funding requests (admin)
+app.get(
+  "/api/admin/funding-requests",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
     try {
-        const { data: user, error } = await supabase
-            .from("users")
-            .select("balance, account_number, account_status")
-            .eq("id", req.userId)
-            .single();
+      const { status, limit = 50, offset = 0 } = req.query;
 
-        if (error || !user) {
-            return res.status(404).json({
-                success: false,
-                message: "User not found",
-            });
-        }
+      // Build the query with proper relationship aliases
+      let query = supabase
+        .from("card_funding_requests")
+        .select(`
+          *,
+          user:users!card_funding_requests_user_id_fkey(
+            id, 
+            name, 
+            email, 
+            account_number, 
+            balance
+          ),
+          card:payment_cards(
+            card_number, 
+            card_holder_name, 
+            card_type
+          ),
+          approved_by_user:users!card_funding_requests_approved_by_fkey(
+            id, 
+            name, 
+            email
+          )
+        `)
+        .order("requested_at", { ascending: false });
 
-        // Ensure account number is properly returned
-        const accountNumber = user.account_number || generateAccountNumber();
+      // Apply status filter
+      if (status && status !== "all") {
+        query = query.eq("status", status);
+      }
+
+      // Apply pagination
+      if (limit) {
+        query = query.range(
+          parseInt(offset), 
+          parseInt(offset) + parseInt(limit) - 1
+        );
+      }
+
+      const { data: requests, error } = await query;
+
+      if (error) {
+        console.error("Admin funding requests error:", error);
+        return res.status(500).json({
+          success: false,
+          message: "Failed to fetch funding requests",
+          error: error.message,
+        });
+      }
+
+      // Get total count for pagination
+      let countQuery = supabase
+        .from("card_funding_requests")
+        .select("*", { count: "exact", head: true });
+
+      if (status && status !== "all") {
+        countQuery = countQuery.eq("status", status);
+      }
+
+      const { count, error: countError } = await countQuery;
+
+      if (countError) {
+        console.error("Count error:", countError);
+      }
+
+      // Mask card numbers for security
+      const maskedRequests = (requests || []).map((req) => {
+        // Create a copy to avoid mutating original
+        const requestCopy = { ...req };
         
-        // If account number is missing, update the user
-        if (!user.account_number) {
-            await supabase
-                .from("users")
-                .update({ account_number: accountNumber })
-                .eq("id", req.userId);
+        if (requestCopy.card) {
+          requestCopy.card = {
+            ...requestCopy.card,
+            card_number: requestCopy.card.card_number 
+              ? requestCopy.card.card_number.replace(/\d(?=\d{4})/g, "*")
+              : null,
+          };
         }
+        
+        return requestCopy;
+      });
 
-        res.json({
-            success: true,
-            balance: parseFloat(user.balance) || 0,
-            account_number: accountNumber,
-            account_status: user.account_status || "active",
-        });
+      res.json({
+        success: true,
+        requests: maskedRequests || [],
+        total: count || 0,
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+      });
     } catch (error) {
-        console.error("Wallet balance error:", error);
-        res.status(500).json({
-            success: false,
-            message: "Failed to fetch balance",
-        });
+      console.error("Admin funding requests error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch funding requests",
+        error: error.message,
+      });
     }
-});
+  },
+);
