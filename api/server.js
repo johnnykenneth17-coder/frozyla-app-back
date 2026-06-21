@@ -82,11 +82,11 @@ app.options("*", cors());
 });*/
 const limiter = rateLimit({
   //windowMs: 15 * 60 * 1000, // 15 minutes
-  windowMs:  60 * 1000,
+  windowMs: 60 * 1000,
   max: 5000, // 100 requests per 15 minutes
   message: {
     success: false,
-    message: "Too many requests from this IP, please try again later."
+    message: "Too many requests from this IP, please try again later.",
   },
   standardHeaders: true,
   legacyHeaders: false,
@@ -106,7 +106,7 @@ app.use("/api", (req, res, next) => {
 const authLimiter = rateLimit({
   //windowMs: 10 * 60 * 1000,
   //max: 20,
-   windowMs: 60 * 1000, // 1 minute
+  windowMs: 60 * 1000, // 1 minute
   max: 200,
   message: "Too many authentication attempts, please try again later.",
 });
@@ -118,7 +118,7 @@ const adminLimiter = rateLimit({
   max: 200, // 200 requests per minute
   message: {
     success: false,
-    message: "Admin rate limit exceeded."
+    message: "Admin rate limit exceeded.",
   },
   standardHeaders: true,
   legacyHeaders: false,
@@ -2141,7 +2141,7 @@ app.get(
       message: "Internal server error",
     });
   }
-});*/
+});
 
 app.post("/api/orders", authMiddleware, async (req, res) => {
   try {
@@ -2263,7 +2263,240 @@ app.post("/api/orders", authMiddleware, async (req, res) => {
       message: error.message || "Failed to create order",
     });
   }
+});*/
+
+// server.js - Fixed POST /api/orders
+
+app.post("/api/orders", authMiddleware, async (req, res) => {
+  try {
+    const {
+      items,
+      total,
+      delivery_address,
+      notes,
+      delivery_phone,
+      delivery_instructions,
+    } = req.body;
+
+    if (!items || !items.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Order must contain items",
+      });
+    }
+
+    const orderTotal =
+      total || items.reduce((sum, i) => sum + i.price * i.quantity, 0);
+    const orderId = `FZ-${Date.now().toString().slice(-6)}`;
+
+    // ✅ STEP 1: Check user balance FIRST
+    const { data: user, error: userError } = await supabase
+      .from("users")
+      .select("balance")
+      .eq("id", req.userId)
+      .single();
+
+    if (userError || !user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const currentBalance = parseFloat(user.balance);
+
+    if (currentBalance < orderTotal) {
+      return res.status(400).json({
+        success: false,
+        message: "Insufficient balance",
+        required: orderTotal,
+        balance: currentBalance,
+        shortfall: orderTotal - currentBalance,
+      });
+    }
+
+    // ✅ STEP 2: Create the order FIRST
+    const orderData = {
+      id: orderId,
+      user_id: req.userId,
+      items: JSON.stringify(items),
+      total: orderTotal,
+      status: "processing",
+      delivery_address: delivery_address || "Store pickup",
+      delivery_phone: delivery_phone || null,
+      delivery_instructions: delivery_instructions || null,
+      notes: notes || "",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data: order, error: orderError } = await supabase
+      .from("orders")
+      .insert([orderData])
+      .select()
+      .single();
+
+    if (orderError) {
+      console.error("Order creation error:", orderError);
+      return res.status(500).json({
+        success: false,
+        message: "Failed to create order",
+        error: orderError.message,
+      });
+    }
+
+    // ✅ STEP 3: NOW deduct from wallet (order exists, so foreign key works)
+    const reference = generateReference();
+
+    // Get user's current balance again (might have changed)
+    const { data: freshUser, error: freshError } = await supabase
+      .from("users")
+      .select("balance")
+      .eq("id", req.userId)
+      .single();
+
+    if (freshError) {
+      throw freshError;
+    }
+
+    const freshBalance = parseFloat(freshUser.balance);
+
+    // Double-check balance hasn't changed
+    if (freshBalance < orderTotal) {
+      // Rollback: Delete the order
+      await supabase.from("orders").delete().eq("id", orderId);
+      return res.status(400).json({
+        success: false,
+        message: "Insufficient balance. Order cancelled.",
+      });
+    }
+
+    // Create transaction record with the order_id
+    const transactionId = uuidv4();
+    const { error: txError } = await supabase
+      .from("wallet_transactions")
+      .insert([
+        {
+          id: transactionId,
+          user_id: req.userId,
+          transaction_type: "debit",
+          amount: orderTotal,
+          balance_before: freshBalance,
+          balance_after: freshBalance - orderTotal,
+          reference: reference,
+          description: `Order payment - ${orderId}`,
+          category: "order",
+          order_id: orderId, // ✅ ORDER EXISTS NOW! No foreign key error
+          status: "completed",
+          created_at: new Date().toISOString(),
+          completed_at: new Date().toISOString(),
+        },
+      ]);
+
+    if (txError) {
+      console.error("Transaction creation error:", txError);
+      // Rollback: Delete the order
+      await supabase.from("orders").delete().eq("id", orderId);
+      throw txError;
+    }
+
+    // ✅ STEP 4: Update user's balance
+    const { error: updateError } = await supabase
+      .from("users")
+      .update({
+        balance: freshBalance - orderTotal,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", req.userId);
+
+    if (updateError) {
+      console.error("Balance update error:", updateError);
+      // Rollback: Delete order and transaction
+      await supabase.from("orders").delete().eq("id", orderId);
+      await supabase
+        .from("wallet_transactions")
+        .delete()
+        .eq("id", transactionId);
+      throw updateError;
+    }
+
+    // ✅ STEP 5: Update account ledger
+    await updateAccountLedger(req.userId);
+
+    // ✅ STEP 6: Create notification
+    await supabase.from("payment_notifications").insert([
+      {
+        user_id: req.userId,
+        type: "payment_success",
+        title: "Order Placed Successfully 🎉",
+        message: `Your order #${orderId} has been placed. ₦${orderTotal.toFixed(2)} has been deducted from your wallet.`,
+        reference: orderId,
+        created_at: new Date().toISOString(),
+      },
+    ]);
+
+    res.status(201).json({
+      success: true,
+      message: "Order created successfully",
+      order: order,
+      balance_after: freshBalance - orderTotal,
+      transaction_id: transactionId,
+    });
+  } catch (error) {
+    console.error("Order error:", error);
+
+    // Attempt to clean up any orphaned data
+    try {
+      // If there's an order ID but no transaction, delete the order
+      if (orderId) {
+        await supabase.from("orders").delete().eq("id", orderId);
+      }
+    } catch (cleanupError) {
+      console.error("Cleanup error:", cleanupError);
+    }
+
+    res.status(500).json({
+      success: false,
+      message: error.message || "Failed to create order",
+    });
+  }
 });
+
+// server.js - Add rollback helper
+
+/*async function rollbackOrder(orderId, transactionId) {
+    const errors = [];
+    
+    try {
+        if (transactionId) {
+            const { error } = await supabase
+                .from("wallet_transactions")
+                .delete()
+                .eq("id", transactionId);
+            if (error) errors.push({ table: 'wallet_transactions', error });
+        }
+    } catch (e) {
+        errors.push({ table: 'wallet_transactions', error: e });
+    }
+
+    try {
+        if (orderId) {
+            const { error } = await supabase
+                .from("orders")
+                .delete()
+                .eq("id", orderId);
+            if (error) errors.push({ table: 'orders', error });
+        }
+    } catch (e) {
+        errors.push({ table: 'orders', error: e });
+    }
+
+    if (errors.length > 0) {
+        console.error('Rollback errors:', errors);
+    }
+    
+    return errors;
+}*/
 
 app.get("/api/orders", authMiddleware, async (req, res) => {
   try {
@@ -2395,7 +2628,7 @@ function generateReference() {
         accountNumber += Math.floor(Math.random() * 10);
     }
     return accountNumber;
-}*/
+}
 
 async function updateUserBalance(
   userId,
@@ -2471,6 +2704,102 @@ async function updateUserBalance(
   await updateAccountLedger(userId);
 
   return { balanceBefore, balanceAfter, transactionId };
+}*/
+
+// server.js - Fixed updateUserBalance helper
+
+async function updateUserBalance(
+    userId,
+    amount,
+    transactionType,
+    description,
+    category,
+    reference,
+    orderId = null,
+    fundingRequestId = null,
+) {
+    // Start a transaction
+    const { data: user, error: userError } = await supabase
+        .from("users")
+        .select("balance")
+        .eq("id", userId)
+        .single();
+
+    if (userError || !user) {
+        throw new Error("User not found");
+    }
+
+    const balanceBefore = parseFloat(user.balance);
+    const amountNum = parseFloat(amount);
+    let balanceAfter;
+
+    if (transactionType === "credit") {
+        balanceAfter = balanceBefore + amountNum;
+    } else if (transactionType === "debit") {
+        if (balanceBefore < amountNum) {
+            throw new Error("Insufficient balance");
+        }
+        balanceAfter = balanceBefore - amountNum;
+    } else {
+        throw new Error("Invalid transaction type");
+    }
+
+    // Update user balance
+    const { error: updateError } = await supabase
+        .from("users")
+        .update({
+            balance: balanceAfter,
+            updated_at: new Date().toISOString(),
+        })
+        .eq("id", userId);
+
+    if (updateError) throw updateError;
+
+    // Create transaction record
+    const transactionId = uuidv4();
+    const transactionData = {
+        id: transactionId,
+        user_id: userId,
+        transaction_type: transactionType,
+        amount: amountNum,
+        balance_before: balanceBefore,
+        balance_after: balanceAfter,
+        reference: reference || generateReference(),
+        description: description,
+        category: category,
+        funding_request_id: fundingRequestId,
+        status: "completed",
+        created_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+    };
+
+    // ✅ Only add order_id if it exists and is valid
+    if (orderId) {
+        // Verify order exists before adding the reference
+        const { data: orderCheck, error: orderCheckError } = await supabase
+            .from("orders")
+            .select("id")
+            .eq("id", orderId)
+            .single();
+
+        if (!orderCheckError && orderCheck) {
+            transactionData.order_id = orderId;
+        } else {
+            // Order doesn't exist, log warning but proceed without order_id
+            console.warn(`Order ${orderId} not found, creating transaction without order reference`);
+        }
+    }
+
+    const { error: txError } = await supabase
+        .from("wallet_transactions")
+        .insert([transactionData]);
+
+    if (txError) throw txError;
+
+    // Update account ledger
+    await updateAccountLedger(userId);
+
+    return { balanceBefore, balanceAfter, transactionId };
 }
 
 async function updateAccountLedger(userId) {
