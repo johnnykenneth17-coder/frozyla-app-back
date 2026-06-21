@@ -2709,97 +2709,99 @@ async function updateUserBalance(
 // server.js - Fixed updateUserBalance helper
 
 async function updateUserBalance(
-    userId,
-    amount,
-    transactionType,
-    description,
-    category,
-    reference,
-    orderId = null,
-    fundingRequestId = null,
+  userId,
+  amount,
+  transactionType,
+  description,
+  category,
+  reference,
+  orderId = null,
+  fundingRequestId = null,
 ) {
-    // Start a transaction
-    const { data: user, error: userError } = await supabase
-        .from("users")
-        .select("balance")
-        .eq("id", userId)
-        .single();
+  // Start a transaction
+  const { data: user, error: userError } = await supabase
+    .from("users")
+    .select("balance")
+    .eq("id", userId)
+    .single();
 
-    if (userError || !user) {
-        throw new Error("User not found");
+  if (userError || !user) {
+    throw new Error("User not found");
+  }
+
+  const balanceBefore = parseFloat(user.balance);
+  const amountNum = parseFloat(amount);
+  let balanceAfter;
+
+  if (transactionType === "credit") {
+    balanceAfter = balanceBefore + amountNum;
+  } else if (transactionType === "debit") {
+    if (balanceBefore < amountNum) {
+      throw new Error("Insufficient balance");
     }
+    balanceAfter = balanceBefore - amountNum;
+  } else {
+    throw new Error("Invalid transaction type");
+  }
 
-    const balanceBefore = parseFloat(user.balance);
-    const amountNum = parseFloat(amount);
-    let balanceAfter;
+  // Update user balance
+  const { error: updateError } = await supabase
+    .from("users")
+    .update({
+      balance: balanceAfter,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", userId);
 
-    if (transactionType === "credit") {
-        balanceAfter = balanceBefore + amountNum;
-    } else if (transactionType === "debit") {
-        if (balanceBefore < amountNum) {
-            throw new Error("Insufficient balance");
-        }
-        balanceAfter = balanceBefore - amountNum;
+  if (updateError) throw updateError;
+
+  // Create transaction record
+  const transactionId = uuidv4();
+  const transactionData = {
+    id: transactionId,
+    user_id: userId,
+    transaction_type: transactionType,
+    amount: amountNum,
+    balance_before: balanceBefore,
+    balance_after: balanceAfter,
+    reference: reference || generateReference(),
+    description: description,
+    category: category,
+    funding_request_id: fundingRequestId,
+    status: "completed",
+    created_at: new Date().toISOString(),
+    completed_at: new Date().toISOString(),
+  };
+
+  // ✅ Only add order_id if it exists and is valid
+  if (orderId) {
+    // Verify order exists before adding the reference
+    const { data: orderCheck, error: orderCheckError } = await supabase
+      .from("orders")
+      .select("id")
+      .eq("id", orderId)
+      .single();
+
+    if (!orderCheckError && orderCheck) {
+      transactionData.order_id = orderId;
     } else {
-        throw new Error("Invalid transaction type");
+      // Order doesn't exist, log warning but proceed without order_id
+      console.warn(
+        `Order ${orderId} not found, creating transaction without order reference`,
+      );
     }
+  }
 
-    // Update user balance
-    const { error: updateError } = await supabase
-        .from("users")
-        .update({
-            balance: balanceAfter,
-            updated_at: new Date().toISOString(),
-        })
-        .eq("id", userId);
+  const { error: txError } = await supabase
+    .from("wallet_transactions")
+    .insert([transactionData]);
 
-    if (updateError) throw updateError;
+  if (txError) throw txError;
 
-    // Create transaction record
-    const transactionId = uuidv4();
-    const transactionData = {
-        id: transactionId,
-        user_id: userId,
-        transaction_type: transactionType,
-        amount: amountNum,
-        balance_before: balanceBefore,
-        balance_after: balanceAfter,
-        reference: reference || generateReference(),
-        description: description,
-        category: category,
-        funding_request_id: fundingRequestId,
-        status: "completed",
-        created_at: new Date().toISOString(),
-        completed_at: new Date().toISOString(),
-    };
+  // Update account ledger
+  await updateAccountLedger(userId);
 
-    // ✅ Only add order_id if it exists and is valid
-    if (orderId) {
-        // Verify order exists before adding the reference
-        const { data: orderCheck, error: orderCheckError } = await supabase
-            .from("orders")
-            .select("id")
-            .eq("id", orderId)
-            .single();
-
-        if (!orderCheckError && orderCheck) {
-            transactionData.order_id = orderId;
-        } else {
-            // Order doesn't exist, log warning but proceed without order_id
-            console.warn(`Order ${orderId} not found, creating transaction without order reference`);
-        }
-    }
-
-    const { error: txError } = await supabase
-        .from("wallet_transactions")
-        .insert([transactionData]);
-
-    if (txError) throw txError;
-
-    // Update account ledger
-    await updateAccountLedger(userId);
-
-    return { balanceBefore, balanceAfter, transactionId };
+  return { balanceBefore, balanceAfter, transactionId };
 }
 
 async function updateAccountLedger(userId) {
@@ -2849,7 +2851,7 @@ async function updateAccountLedger(userId) {
 // ===== USER ROUTES =====
 
 // Get user wallet balance
-app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
+/*app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
   try {
     const { data: user, error } = await supabase
       .from("users")
@@ -2925,6 +2927,317 @@ app.get("/api/wallet/transactions", authMiddleware, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch transactions",
+    });
+  }
+});*/
+
+// server.js - Fixed GET /api/wallet/balance
+
+// Get user wallet balance
+app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
+  try {
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("balance, account_number, account_status, name, email")
+      .eq("id", req.userId)
+      .single();
+
+    if (error || !user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // Ensure account number exists
+    let accountNumber = user.account_number;
+    if (!accountNumber) {
+      accountNumber = generateAccountNumber();
+      await supabase
+        .from("users")
+        .update({ account_number: accountNumber })
+        .eq("id", req.userId);
+    }
+
+    // Get total spent (sum of all debit transactions)
+    const { data: spentData, error: spentError } = await supabase
+      .from("wallet_transactions")
+      .select("amount")
+      .eq("user_id", req.userId)
+      .eq("transaction_type", "debit")
+      .eq("status", "completed");
+
+    let totalSpent = 0;
+    if (!spentError && spentData) {
+      totalSpent = spentData.reduce(
+        (sum, tx) => sum + parseFloat(tx.amount),
+        0,
+      );
+    }
+
+    // Get total orders count
+    const { count: ordersCount, error: ordersError } = await supabase
+      .from("orders")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", req.userId);
+
+    res.json({
+      success: true,
+      balance: parseFloat(user.balance) || 0,
+      account_number: accountNumber,
+      account_status: user.account_status || "active",
+      total_spent: totalSpent,
+      total_orders: ordersError ? 0 : ordersCount || 0,
+      user: {
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (error) {
+    console.error("Wallet balance error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch balance",
+      error: error.message,
+    });
+  }
+});
+
+// server.js - Add GET /api/wallet/transactions/:id
+
+// Get single transaction details
+app.get("/api/wallet/transactions/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: transaction, error } = await supabase
+      .from("wallet_transactions")
+      .select(
+        `
+                *,
+                order:orders!wallet_transactions_order_id_fkey(
+                    id,
+                    status,
+                    total,
+                    created_at,
+                    items
+                ),
+                funding_request:card_funding_requests(
+                    id,
+                    amount,
+                    status,
+                    requested_at,
+                    approved_at
+                )
+            `,
+      )
+      .eq("id", id)
+      .eq("user_id", req.userId)
+      .single();
+
+    if (error || !transaction) {
+      return res.status(404).json({
+        success: false,
+        message: "Transaction not found",
+      });
+    }
+
+    // Format the response
+    const formattedTransaction = {
+      id: transaction.id,
+      user_id: transaction.user_id,
+      transaction_type: transaction.transaction_type,
+      amount: parseFloat(transaction.amount),
+      balance_before: parseFloat(transaction.balance_before),
+      balance_after: parseFloat(transaction.balance_after),
+      reference: transaction.reference,
+      description: transaction.description,
+      category: transaction.category,
+      order_id: transaction.order_id,
+      order: transaction.order
+        ? {
+            id: transaction.order.id,
+            status: transaction.order.status,
+            total: parseFloat(transaction.order.total),
+            created_at: transaction.order.created_at,
+            items: transaction.order.items
+              ? JSON.parse(transaction.order.items)
+              : [],
+          }
+        : null,
+      funding_request_id: transaction.funding_request_id,
+      funding_request: transaction.funding_request
+        ? {
+            id: transaction.funding_request.id,
+            amount: parseFloat(transaction.funding_request.amount),
+            status: transaction.funding_request.status,
+            requested_at: transaction.funding_request.requested_at,
+          }
+        : null,
+      status: transaction.status,
+      created_at: transaction.created_at,
+      completed_at: transaction.completed_at,
+    };
+
+    res.json({
+      success: true,
+      transaction: formattedTransaction,
+    });
+  } catch (error) {
+    console.error("Transaction detail error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch transaction",
+      error: error.message,
+    });
+  }
+});
+
+// server.js - Fixed GET /api/wallet/transactions
+
+// Get user transactions
+app.get("/api/wallet/transactions", authMiddleware, async (req, res) => {
+  try {
+    const {
+      limit = 50,
+      offset = 0,
+      type,
+      start_date,
+      end_date,
+      order_id,
+    } = req.query;
+
+    // Build the query
+    let query = supabase
+      .from("wallet_transactions")
+      .select(
+        `
+                *,
+                order:orders!wallet_transactions_order_id_fkey(
+                    id,
+                    status,
+                    total,
+                    created_at
+                ),
+                funding_request:card_funding_requests(
+                    id,
+                    amount,
+                    status,
+                    requested_at
+                )
+            `,
+      )
+      .eq("user_id", req.userId)
+      .order("created_at", { ascending: false });
+
+    // Apply filters
+    if (type) {
+      query = query.eq("transaction_type", type);
+    }
+
+    if (order_id) {
+      query = query.eq("order_id", order_id);
+    }
+
+    if (start_date) {
+      query = query.gte("created_at", start_date);
+    }
+
+    if (end_date) {
+      query = query.lte("created_at", end_date);
+    }
+
+    // Apply pagination
+    const from = parseInt(offset);
+    const to = from + parseInt(limit) - 1;
+    query = query.range(from, to);
+
+    const { data: transactions, error } = await query;
+
+    if (error) {
+      console.error("Transactions fetch error:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Failed to fetch transactions",
+        error: error.message,
+      });
+    }
+
+    // Get total count
+    let countQuery = supabase
+      .from("wallet_transactions")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", req.userId);
+
+    if (type) {
+      countQuery = countQuery.eq("transaction_type", type);
+    }
+
+    if (order_id) {
+      countQuery = countQuery.eq("order_id", order_id);
+    }
+
+    if (start_date) {
+      countQuery = countQuery.gte("created_at", start_date);
+    }
+
+    if (end_date) {
+      countQuery = countQuery.lte("created_at", end_date);
+    }
+
+    const { count, error: countError } = await countQuery;
+
+    if (countError) {
+      console.error("Count error:", countError);
+    }
+
+    // Format the response
+    const formattedTransactions = (transactions || []).map((tx) => ({
+      id: tx.id,
+      user_id: tx.user_id,
+      transaction_type: tx.transaction_type,
+      amount: parseFloat(tx.amount),
+      balance_before: parseFloat(tx.balance_before),
+      balance_after: parseFloat(tx.balance_after),
+      reference: tx.reference,
+      description: tx.description,
+      category: tx.category,
+      order_id: tx.order_id,
+      order: tx.order
+        ? {
+            id: tx.order.id,
+            status: tx.order.status,
+            total: parseFloat(tx.order.total),
+            created_at: tx.order.created_at,
+          }
+        : null,
+      funding_request_id: tx.funding_request_id,
+      funding_request: tx.funding_request
+        ? {
+            id: tx.funding_request.id,
+            amount: parseFloat(tx.funding_request.amount),
+            status: tx.funding_request.status,
+            requested_at: tx.funding_request.requested_at,
+          }
+        : null,
+      status: tx.status,
+      created_at: tx.created_at,
+      completed_at: tx.completed_at,
+    }));
+
+    res.json({
+      success: true,
+      transactions: formattedTransactions,
+      total: count || 0,
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+    });
+  } catch (error) {
+    console.error("Transactions error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch transactions",
+      error: error.message,
     });
   }
 });
@@ -3669,7 +3982,7 @@ app.get(
 );
 
 // Get account ledger discrepancies (admin)
-app.get(
+/*app.get(
   "/api/admin/ledger/discrepancies",
   authMiddleware,
   adminMiddleware,
@@ -3697,6 +4010,98 @@ app.get(
       res.status(500).json({
         success: false,
         message: "Failed to fetch discrepancies",
+      });
+    }
+  },
+);*/
+
+// server.js - Fixed GET /api/admin/ledger/discrepancies
+
+// Get account ledger discrepancies (admin)
+app.get(
+  "/api/admin/ledger/discrepancies",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      // Get all flagged discrepancies
+      const { data: discrepancies, error } = await supabase
+        .from("account_ledger")
+        .select(
+          `
+                    *,
+                    user:users!account_ledger_user_id_fkey(
+                        id, 
+                        name, 
+                        email, 
+                        account_number, 
+                        balance
+                    )
+                `,
+        )
+        .eq("status", "flagged")
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error("Ledger discrepancies error:", error);
+        return res.status(500).json({
+          success: false,
+          message: "Failed to fetch ledger discrepancies",
+          error: error.message,
+        });
+      }
+
+      // Format the response
+      const formattedDiscrepancies = (discrepancies || []).map((entry) => ({
+        id: entry.id,
+        user_id: entry.user_id,
+        user: entry.user
+          ? {
+              id: entry.user.id,
+              name: entry.user.name,
+              email: entry.user.email,
+              account_number: entry.user.account_number,
+              balance: parseFloat(entry.user.balance),
+            }
+          : null,
+        ledger_balance: parseFloat(entry.ledger_balance),
+        actual_balance: parseFloat(entry.actual_balance),
+        difference: parseFloat(entry.difference),
+        status: entry.status,
+        flagged_reason: entry.flagged_reason,
+        resolved_at: entry.resolved_at,
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+      }));
+
+      // Also get recent ledger entries for each user
+      const usersWithLedger = await Promise.all(
+        (discrepancies || []).map(async (entry) => {
+          const { data: recentEntries } = await supabase
+            .from("account_ledger")
+            .select("ledger_balance, actual_balance, status, created_at")
+            .eq("user_id", entry.user_id)
+            .order("created_at", { ascending: false })
+            .limit(5);
+
+          return {
+            ...entry,
+            recent_entries: recentEntries || [],
+          };
+        }),
+      );
+
+      res.json({
+        success: true,
+        discrepancies: formattedDiscrepancies,
+        total: formattedDiscrepancies.length,
+      });
+    } catch (error) {
+      console.error("Ledger discrepancies error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch ledger discrepancies",
+        error: error.message,
       });
     }
   },
