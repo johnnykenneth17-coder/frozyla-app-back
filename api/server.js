@@ -82,8 +82,8 @@ app.options("*", cors());
 });*/
 const limiter = rateLimit({
   //windowMs: 15 * 60 * 1000, // 15 minutes
-  windowMs: 60 * 1000,
-  max: 500, // 100 requests per 15 minutes
+  windowMs:  60 * 1000,
+  max: 5000, // 100 requests per 15 minutes
   message: {
     success: false,
     message: "Too many requests from this IP, please try again later."
