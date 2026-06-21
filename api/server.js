@@ -20,6 +20,7 @@ const {
   getProfile,
   changePassword,
   refreshToken,
+  generateAccountNumber,
 } = require("../middleware/auth");
 
 const app = express();
@@ -2347,11 +2348,14 @@ function generateReference() {
   return `${prefix}${timestamp}${random}`;
 }
 
-function generateAccountNumber() {
-  const prefix = "FZ";
-  const number = Math.floor(1000000000 + Math.random() * 9000000000);
-  return `${prefix}${number}`;
-}
+/*function generateAccountNumber() {
+    // Generate a 10-digit number only (no letters)
+    let accountNumber = '';
+    for (let i = 0; i < 10; i++) {
+        accountNumber += Math.floor(Math.random() * 10);
+    }
+    return accountNumber;
+}*/
 
 async function updateUserBalance(
   userId,

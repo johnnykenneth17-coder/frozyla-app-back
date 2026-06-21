@@ -93,6 +93,15 @@ function sanitizeInput(input) {
   return input.trim().replace(/[<>]/g, "");
 }
 
+function generateAccountNumber() {
+    // Generate a 10-digit number only (no letters)
+    let accountNumber = '';
+    for (let i = 0; i < 10; i++) {
+        accountNumber += Math.floor(Math.random() * 10);
+    }
+    return accountNumber;
+}
+
 // ===== AUTH FUNCTIONS =====
 async function signupUser(req, res) {
   try {
@@ -110,6 +119,7 @@ async function signupUser(req, res) {
     // Sanitize inputs
     const sanitizedEmail = sanitizeInput(email.toLowerCase());
     const sanitizedName = sanitizeInput(name);
+    const accountNumber = generateAccountNumber();
 
     // Validate email format
     if (!validateEmail(sanitizedEmail)) {
@@ -157,6 +167,7 @@ async function signupUser(req, res) {
           password: hashedPassword,
           name: sanitizedName,
           role: "user",
+          account_number: accountNumber,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         },
@@ -419,4 +430,5 @@ module.exports = {
   validateEmail,
   validatePassword,
   sanitizeInput,
+  generateAccountNumber,
 };
