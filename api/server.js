@@ -75,12 +75,32 @@ app.use(
 app.options("*", cors());
 
 // ===== RATE LIMITING =====
-const limiter = rateLimit({
+/*const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
   message: "Too many requests from this IP, please try again later.",
+});*/
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 500, // 100 requests per 15 minutes
+  message: {
+    success: false,
+    message: "Too many requests from this IP, please try again later."
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
-app.use("/api", limiter);
+
+//app.use("/api", limiter);
+
+app.use("/api", (req, res, next) => {
+  // If authenticated, use auth limiter
+  if (req.headers.authorization) {
+    return authLimiter(req, res, next);
+  }
+  // Otherwise use general limiter
+  return limiter(req, res, next);
+});
 
 const authLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
@@ -88,6 +108,23 @@ const authLimiter = rateLimit({
   message: "Too many authentication attempts, please try again later.",
 });
 app.use("/api/auth", authLimiter);
+
+// ✅ NEW: Very lenient limiter for admin users
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 200, // 200 requests per minute
+  message: {
+    success: false,
+    message: "Admin rate limit exceeded."
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Admin routes - more lenient
+app.use("/api/admin", (req, res, next) => {
+  return adminLimiter(req, res, next);
+});
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));

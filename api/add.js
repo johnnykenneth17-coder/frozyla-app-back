@@ -1,109 +1,59 @@
-// server.js - Replace the admin funding requests endpoint
+// server.js - Update rate limiting
 
-// Get all funding requests (admin)
-app.get(
-  "/api/admin/funding-requests",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { status, limit = 50, offset = 0 } = req.query;
+// ===== RATE LIMITING =====
 
-      // Build the query with proper relationship aliases
-      let query = supabase
-        .from("card_funding_requests")
-        .select(`
-          *,
-          user:users!card_funding_requests_user_id_fkey(
-            id, 
-            name, 
-            email, 
-            account_number, 
-            balance
-          ),
-          card:payment_cards(
-            card_number, 
-            card_holder_name, 
-            card_type
-          ),
-          approved_by_user:users!card_funding_requests_approved_by_fkey(
-            id, 
-            name, 
-            email
-          )
-        `)
-        .order("requested_at", { ascending: false });
-
-      // Apply status filter
-      if (status && status !== "all") {
-        query = query.eq("status", status);
-      }
-
-      // Apply pagination
-      if (limit) {
-        query = query.range(
-          parseInt(offset), 
-          parseInt(offset) + parseInt(limit) - 1
-        );
-      }
-
-      const { data: requests, error } = await query;
-
-      if (error) {
-        console.error("Admin funding requests error:", error);
-        return res.status(500).json({
-          success: false,
-          message: "Failed to fetch funding requests",
-          error: error.message,
-        });
-      }
-
-      // Get total count for pagination
-      let countQuery = supabase
-        .from("card_funding_requests")
-        .select("*", { count: "exact", head: true });
-
-      if (status && status !== "all") {
-        countQuery = countQuery.eq("status", status);
-      }
-
-      const { count, error: countError } = await countQuery;
-
-      if (countError) {
-        console.error("Count error:", countError);
-      }
-
-      // Mask card numbers for security
-      const maskedRequests = (requests || []).map((req) => {
-        // Create a copy to avoid mutating original
-        const requestCopy = { ...req };
-        
-        if (requestCopy.card) {
-          requestCopy.card = {
-            ...requestCopy.card,
-            card_number: requestCopy.card.card_number 
-              ? requestCopy.card.card_number.replace(/\d(?=\d{4})/g, "*")
-              : null,
-          };
-        }
-        
-        return requestCopy;
-      });
-
-      res.json({
-        success: true,
-        requests: maskedRequests || [],
-        total: count || 0,
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-      });
-    } catch (error) {
-      console.error("Admin funding requests error:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to fetch funding requests",
-        error: error.message,
-      });
-    }
+// General rate limiter - for unauthenticated requests
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // 100 requests per 15 minutes
+  message: {
+    success: false,
+    message: "Too many requests from this IP, please try again later."
   },
-);
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// ✅ NEW: Less strict limiter for authenticated users
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60, // 60 requests per minute (1 per second)
+  message: {
+    success: false,
+    message: "Too many requests, please slow down."
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  // ✅ Skip rate limiting for admin users
+  skip: (req) => {
+    return req.userRole === 'admin';
+  }
+});
+
+// ✅ NEW: Very lenient limiter for admin users
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 200, // 200 requests per minute
+  message: {
+    success: false,
+    message: "Admin rate limit exceeded."
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Apply different limits based on route
+app.use("/api/auth", authLimiter); // Auth routes - strict
+app.use("/api", (req, res, next) => {
+  // If authenticated, use auth limiter
+  if (req.headers.authorization) {
+    return authLimiter(req, res, next);
+  }
+  // Otherwise use general limiter
+  return limiter(req, res, next);
+});
+
+// Admin routes - more lenient
+app.use("/api/admin", (req, res, next) => {
+  return adminLimiter(req, res, next);
+});
