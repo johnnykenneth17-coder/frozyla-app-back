@@ -2792,7 +2792,7 @@ async function updateUserBalance(
   };
 
   // ✅ Only add order_id if it exists and is valid
-  if (orderId) {
+  /*if (orderId) {
     // Verify order exists before adding the reference
     const { data: orderCheck, error: orderCheckError } = await supabase
       .from("orders")
@@ -2808,7 +2808,7 @@ async function updateUserBalance(
         `Order ${orderId} not found, creating transaction without order reference`,
       );
     }
-  }
+  }*/
 
   const { error: txError } = await supabase
     .from("wallet_transactions")
