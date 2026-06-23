@@ -5460,7 +5460,7 @@ app.get(
       });
     }
   },
-);*/
+);
 
 // server.js - Updated merge ledger
 
@@ -5593,7 +5593,7 @@ app.patch(
       });
     }
   },
-);
+);*/
 
 // Reset user balance to ledger (admin)
 /*app.patch(
@@ -5697,7 +5697,7 @@ app.patch(
       });
     }
   },
-);*/
+);
 
 // server.js - Updated reset ledger
 
@@ -5771,7 +5771,352 @@ app.patch(
       });
     }
   },
+);*/
+
+// server.js - Replace the merge and reset endpoints with these
+
+// Merge: Accept user's actual balance as source of truth
+app.patch(
+  "/api/admin/ledger/:id/merge",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { notes } = req.body;
+
+      // Get reconciliation entry
+      const { data: reconciliation, error: recError } = await supabase
+        .from("ledger_reconciliation")
+        .select("*")
+        .eq("id", id)
+        .single();
+
+      if (recError || !reconciliation) {
+        return res.status(404).json({
+          success: false,
+          message: "Reconciliation entry not found",
+        });
+      }
+
+      if (reconciliation.status === "merged" || reconciliation.status === "resolved") {
+        return res.status(400).json({
+          success: false,
+          message: "This entry has already been resolved",
+        });
+      }
+
+      // Get user's current balance
+      const { data: user, error: userError } = await supabase
+        .from("users")
+        .select("balance")
+        .eq("id", reconciliation.user_id)
+        .single();
+
+      if (userError || !user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      const userBalance = parseFloat(user.balance);
+      const ledgerBalance = parseFloat(reconciliation.ledger_balance);
+
+      // STEP 1: Update ledger balance to match user's actual balance
+      // Get the user wallet account ID (account_code '2000')
+      const { data: walletAccount, error: accountError } = await supabase
+        .from("ledger_accounts")
+        .select("id")
+        .eq("account_code", "2000")
+        .single();
+
+      if (accountError || !walletAccount) {
+        return res.status(500).json({
+          success: false,
+          message: "Wallet account not found",
+        });
+      }
+
+      // Update account_balances to match user balance
+      const { error: balanceUpdateError } = await supabase
+        .from("account_balances")
+        .update({
+          balance: userBalance,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("account_id", walletAccount.id)
+        .eq("user_id", reconciliation.user_id);
+
+      if (balanceUpdateError) {
+        console.error("Balance update error:", balanceUpdateError);
+        // If no record exists, insert one
+        const { error: insertError } = await supabase
+          .from("account_balances")
+          .insert([
+            {
+              account_id: walletAccount.id,
+              user_id: reconciliation.user_id,
+              balance: userBalance,
+              updated_at: new Date().toISOString(),
+            },
+          ]);
+
+        if (insertError) {
+          return res.status(500).json({
+            success: false,
+            message: "Failed to update ledger balance",
+          });
+        }
+      }
+
+      // STEP 2: Create a ledger entry for the adjustment (merge)
+      const reference = generateReference();
+      
+      // Create ledger entry with double-entry
+      await createLedgerEntry({
+        description: `Balance adjustment - merged with user balance (${reference})`,
+        referenceType: "adjustment",
+        referenceId: id,
+        createdBy: req.userId,
+        entries: [
+          {
+            // Debit/credit to adjust ledger to match user balance
+            accountCode: "2000", // User Wallet
+            userId: reconciliation.user_id,
+            debit: userBalance > ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
+            credit: userBalance < ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
+            description: `Merge: User balance accepted as source of truth (${reference})`,
+          },
+          {
+            // Contra account for the adjustment
+            accountCode: "3000", // User Equity
+            userId: reconciliation.user_id,
+            debit: userBalance < ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
+            credit: userBalance > ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
+            description: `Merge: User balance accepted as source of truth (${reference})`,
+          },
+        ],
+      });
+
+      // STEP 3: Create a wallet transaction record for the adjustment
+      const transactionId = uuidv4();
+      const { error: txError } = await supabase
+        .from("wallet_transactions")
+        .insert([
+          {
+            id: transactionId,
+            user_id: reconciliation.user_id,
+            transaction_type: "adjustment",
+            amount: Math.abs(userBalance - ledgerBalance),
+            balance_before: ledgerBalance,
+            balance_after: userBalance,
+            reference: reference,
+            description: `Balance adjustment - merged with user balance`,
+            category: "adjustment",
+            status: "completed",
+            created_at: new Date().toISOString(),
+            completed_at: new Date().toISOString(),
+          },
+        ]);
+
+      if (txError) {
+        console.error("Transaction creation error:", txError);
+        // Non-critical, continue
+      }
+
+      // STEP 4: Update reconciliation status
+      const { data: updated, error: statusError } = await supabase
+        .from("ledger_reconciliation")
+        .update({
+          status: "merged",
+          resolved_at: new Date().toISOString(),
+          resolved_by: req.userId,
+          resolution_notes: notes || `Merged: User balance (₦${userBalance.toFixed(2)}) accepted as source of truth`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", id)
+        .select()
+        .single();
+
+      if (statusError) throw statusError;
+
+      // STEP 5: Create notification for user
+      await supabase.from("payment_notifications").insert([
+        {
+          user_id: reconciliation.user_id,
+          type: "adjustment",
+          title: "Balance Adjustment",
+          message: `Your wallet balance has been adjusted to match your current balance. New balance: ₦${userBalance.toFixed(2)}`,
+          created_at: new Date().toISOString(),
+        },
+      ]);
+
+      res.json({
+        success: true,
+        message: "User balance accepted as source of truth. Ledger updated to match user balance.",
+        reconciliation: updated,
+        balance_after: userBalance,
+      });
+    } catch (error) {
+      console.error("Merge ledger error:", error);
+      res.status(500).json({
+        success: false,
+        message: error.message || "Failed to merge balance",
+      });
+    }
+  }
 );
+
+// Reject: Accept ledger balance as source of truth (reset user balance to ledger)
+app.patch(
+  "/api/admin/ledger/:id/reject",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { notes } = req.body;
+
+      // Get reconciliation entry
+      const { data: reconciliation, error: recError } = await supabase
+        .from("ledger_reconciliation")
+        .select("*")
+        .eq("id", id)
+        .single();
+
+      if (recError || !reconciliation) {
+        return res.status(404).json({
+          success: false,
+          message: "Reconciliation entry not found",
+        });
+      }
+
+      if (reconciliation.status === "merged" || reconciliation.status === "resolved") {
+        return res.status(400).json({
+          success: false,
+          message: "This entry has already been resolved",
+        });
+      }
+
+      const userBalance = parseFloat(reconciliation.actual_balance);
+      const ledgerBalance = parseFloat(reconciliation.ledger_balance);
+
+      // STEP 1: Update user balance to match ledger balance
+      const { error: updateError } = await supabase
+        .from("users")
+        .update({
+          balance: ledgerBalance,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", reconciliation.user_id);
+
+      if (updateError) {
+        return res.status(500).json({
+          success: false,
+          message: "Failed to update user balance",
+        });
+      }
+
+      // STEP 2: Create a ledger entry for the adjustment (reject)
+      const reference = generateReference();
+
+      // Create ledger entry with double-entry
+      await createLedgerEntry({
+        description: `Balance adjustment - rejected user balance, ledger accepted (${reference})`,
+        referenceType: "adjustment",
+        referenceId: id,
+        createdBy: req.userId,
+        entries: [
+          {
+            // Debit/credit to adjust user balance to match ledger
+            accountCode: "2000", // User Wallet
+            userId: reconciliation.user_id,
+            debit: userBalance > ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
+            credit: userBalance < ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
+            description: `Reject: Ledger balance accepted as source of truth (${reference})`,
+          },
+          {
+            // Contra account for the adjustment
+            accountCode: "3000", // User Equity
+            userId: reconciliation.user_id,
+            debit: userBalance < ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
+            credit: userBalance > ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
+            description: `Reject: Ledger balance accepted as source of truth (${reference})`,
+          },
+        ],
+      });
+
+      // STEP 3: Create a wallet transaction record for the adjustment
+      const transactionId = uuidv4();
+      const { error: txError } = await supabase
+        .from("wallet_transactions")
+        .insert([
+          {
+            id: transactionId,
+            user_id: reconciliation.user_id,
+            transaction_type: "adjustment",
+            amount: Math.abs(userBalance - ledgerBalance),
+            balance_before: userBalance,
+            balance_after: ledgerBalance,
+            reference: reference,
+            description: `Balance adjustment - rejected user balance, ledger accepted`,
+            category: "adjustment",
+            status: "completed",
+            created_at: new Date().toISOString(),
+            completed_at: new Date().toISOString(),
+          },
+        ]);
+
+      if (txError) {
+        console.error("Transaction creation error:", txError);
+        // Non-critical, continue
+      }
+
+      // STEP 4: Update reconciliation status to "resolved" (rejected)
+      const { data: updated, error: statusError } = await supabase
+        .from("ledger_reconciliation")
+        .update({
+          status: "resolved",
+          resolved_at: new Date().toISOString(),
+          resolved_by: req.userId,
+          resolution_notes: notes || `Rejected: Ledger balance (₦${ledgerBalance.toFixed(2)}) accepted as source of truth`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", id)
+        .select()
+        .single();
+
+      if (statusError) throw statusError;
+
+      // STEP 5: Create notification for user
+      await supabase.from("payment_notifications").insert([
+        {
+          user_id: reconciliation.user_id,
+          type: "adjustment",
+          title: "Balance Adjustment",
+          message: `Your wallet balance has been adjusted to match the ledger balance. New balance: ₦${ledgerBalance.toFixed(2)}`,
+          created_at: new Date().toISOString(),
+        },
+      ]);
+
+      res.json({
+        success: true,
+        message: "Ledger balance accepted as source of truth. User balance updated to match ledger.",
+        reconciliation: updated,
+        balance_after: ledgerBalance,
+      });
+    } catch (error) {
+      console.error("Reject ledger error:", error);
+      res.status(500).json({
+        success: false,
+        message: error.message || "Failed to reject user balance",
+      });
+    }
+  }
+);
+
+
 
 // server.js - Add this endpoint
 
