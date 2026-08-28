@@ -6,3 +6,5 @@ function generateReference() {
   const random = Math.random().toString(36).substring(2, 8).toUpperCase();
   return `${prefix}${timestamp}${random}`;
 }
+
+const api = new FrozylaAPI();

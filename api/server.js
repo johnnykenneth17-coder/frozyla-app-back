@@ -17,11 +17,16 @@ const {
   staffMiddleware,
   signupUser,
   loginUser,
+  loginWithPasscode,
+  googleAuth,
   getProfile,
   changePassword,
   refreshToken,
-  generateAccountNumber,
+  generateIdNumber,
 } = require("../middleware/auth");
+
+const analyticsRoutes = require("./lib/analytics-routes");
+const opsRoutes = require("./lib/ops-routes");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -124,6 +129,15 @@ const adminLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const { rawBodyJson, verifyFeecentSignature } = require("./frozyla-feecent-auth-middleware");
+   const frozylaIntegrationRouter = require("./frozyla-integration-routes");
+   app.use(
+     "/api/v1/integrations/feecent/frozyla",
+     rawBodyJson,
+     verifyFeecentSignature,
+     frozylaIntegrationRouter,
+   );
+
 // Admin routes - more lenient
 app.use("/api/admin", (req, res, next) => {
   return adminLimiter(req, res, next);
@@ -131,6 +145,10 @@ app.use("/api/admin", (req, res, next) => {
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// ===== ANALYTICS & OPERATIONS PLATFORMS =====
+app.use("/api/admin/analytics", analyticsRoutes);
+app.use("/api/admin/ops", opsRoutes);
 
 // ===== SUPABASE INIT =====
 const supabase = createClient(
@@ -161,6 +179,8 @@ app.get("/api/cors-test", (req, res) => {
 // ===== AUTH ROUTES =====
 app.post("/api/auth/signup", signupUser);
 app.post("/api/auth/login", loginUser);
+app.post("/api/auth/login-passcode", loginWithPasscode);
+app.post("/api/auth/google", googleAuth);
 app.get("/api/auth/profile", authMiddleware, getProfile);
 app.post("/api/auth/change-password", authMiddleware, changePassword);
 app.post("/api/auth/refresh", authMiddleware, refreshToken);
@@ -2956,7 +2976,7 @@ app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
   try {
     const { data: user, error } = await supabase
       .from("users")
-      .select("balance, account_number, account_status, name, email")
+      .select("balance, account_number, account_status, name, email, phone")
       .eq("id", req.userId)
       .single();
 
@@ -2967,14 +2987,24 @@ app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
       });
     }
 
-    // Ensure account number exists
+    // Ensure ID number exists (legacy users created before this field existed)
     let accountNumber = user.account_number;
     if (!accountNumber) {
-      accountNumber = generateAccountNumber();
-      await supabase
+      accountNumber = await generateIdNumber(user.phone);
+      const { error: backfillError } = await supabase
         .from("users")
         .update({ account_number: accountNumber })
         .eq("id", req.userId);
+      if (backfillError && backfillError.code === "23505") {
+        // Lost a race with another concurrent backfill/signup - regenerate once
+        accountNumber = await generateIdNumber(user.phone, {
+          excludePhoneDerived: true,
+        });
+        await supabase
+          .from("users")
+          .update({ account_number: accountNumber })
+          .eq("id", req.userId);
+      }
     }
 
     // Get total spent (sum of all debit transactions)
