@@ -129,8 +129,8 @@ const adminLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const { rawBodyJson, verifyFeecentSignature } = require("./frozyla-feecent-auth-middleware");
-   const frozylaIntegrationRouter = require("./frozyla-integration-routes");
+const { rawBodyJson, verifyFeecentSignature } = require("./lib/frozyla-feecent-auth-middleware");
+   const frozylaIntegrationRouter = require("./lib/frozyla-integration-routes");
    app.use(
      "/api/v1/integrations/feecent/frozyla",
      rawBodyJson,
