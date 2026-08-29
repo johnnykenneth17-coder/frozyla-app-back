@@ -129,6 +129,9 @@ const adminLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const frozylaCronRouter = require("./lib/frozyla-cron-routes");
+   app.use("/api/cron", frozylaCronRouter);
+
 const { rawBodyJson, verifyFeecentSignature } = require("./lib/frozyla-feecent-auth-middleware");
    const frozylaIntegrationRouter = require("./lib/frozyla-integration-routes");
    app.use(
@@ -1182,7 +1185,7 @@ app.patch("/api/orders/:id/delivery", authMiddleware, async (req, res) => {
 });
 
 // Update delivery status (admin only)
-app.patch(
+/*app.patch(
   "/api/admin/orders/:id/delivery-status",
   authMiddleware,
   adminMiddleware,
@@ -1250,7 +1253,84 @@ app.patch(
       });
     }
   },
+);*/
+
+app.patch(
+  "/api/admin/orders/:id/delivery-status",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { delivery_status, tracking_id, reason } = req.body;
+
+      // Old delivery_status vocabulary -> new unified orders.status
+      // vocabulary. Anything not in this map is rejected outright,
+      // same as the old validStatuses array did.
+      const STATUS_MAP = {
+        preparing: "PREPARING",
+        ready: "READY_FOR_DELIVERY",
+        out_for_delivery: "OUT_FOR_DELIVERY",
+        delivered: "DELIVERED",
+        failed: "FULFILLMENT_FAILED",
+      };
+      const newStatus = STATUS_MAP[delivery_status];
+      if (!newStatus) {
+        return res.status(400).json({ success: false, message: "Invalid delivery status" });
+      }
+
+      const { data: result, error } = await supabase.rpc("transition_order_status", {
+        p_order_id: id,
+        p_new_status: newStatus,
+        p_actor_type: "admin",
+        p_actor_id: req.userId,
+        p_reason: reason || null,
+      });
+
+      if (error) {
+        console.error("transition_order_status RPC error:", error);
+        return res.status(500).json({ success: false, message: "Failed to update delivery status" });
+      }
+      if (!result.success) {
+        const statusCode = result.code === "ORDER_NOT_FOUND" ? 404 : 400;
+        return res.status(statusCode).json(result);
+      }
+
+      // Metadata fields unrelated to the state machine — still just
+      // plain column updates, same as before.
+      const metadataUpdate = { updated_at: new Date().toISOString() };
+      if (delivery_status === "out_for_delivery") {
+        metadataUpdate.estimated_delivery_time = new Date(Date.now() + 30 * 60000);
+      }
+      if (delivery_status === "delivered") {
+        metadataUpdate.actual_delivery_time = new Date().toISOString();
+      }
+      if (tracking_id) {
+        metadataUpdate.delivery_tracking_id = tracking_id;
+      }
+
+      const { data, error: updateErr } = await supabase
+        .from("orders")
+        .update(metadataUpdate)
+        .eq("id", id)
+        .select()
+        .single();
+
+      if (updateErr) {
+        console.error("Delivery metadata update failed:", updateErr);
+        // Status transition already committed successfully at this
+        // point — don't report this as a failure of the whole
+        // request, the status change is real and correct either way.
+      }
+
+      res.json({ success: true, message: "Order updated", order: data, ...result });
+    } catch (error) {
+      console.error("Delivery status update error:", error);
+      res.status(500).json({ success: false, message: "Failed to update delivery details" });
+    }
+  },
 );
+
 
 // Get delivery tracking info
 app.get("/api/orders/:id/track", authMiddleware, async (req, res) => {
@@ -1763,6 +1843,26 @@ app.patch(
   },
 );
 
+app.post("/api/admin/orders/:id/confirm", authMiddleware, adminMiddleware, async (req, res) => {
+  const { data: result, error } = await supabase.rpc("transition_order_status", {
+    p_order_id: req.params.id, p_new_status: "CONFIRMED",
+    p_actor_type: "admin", p_actor_id: req.userId, p_reason: req.body.reason || null,
+  });
+  if (error) return res.status(500).json({ success: false, message: "Failed to confirm order" });
+  if (!result.success) return res.status(result.code === "ORDER_NOT_FOUND" ? 404 : 400).json(result);
+  res.json({ success: true, ...result });
+});
+
+app.post("/api/admin/orders/:id/start-preparing", authMiddleware, adminMiddleware, async (req, res) => {
+  const { data: result, error } = await supabase.rpc("transition_order_status", {
+    p_order_id: req.params.id, p_new_status: "PREPARING",
+    p_actor_type: "admin", p_actor_id: req.userId, p_reason: req.body.reason || null,
+  });
+  if (error) return res.status(500).json({ success: false, message: "Failed to update order" });
+  if (!result.success) return res.status(result.code === "ORDER_NOT_FOUND" ? 404 : 400).json(result);
+  res.json({ success: true, ...result });
+});
+
 // Get staff performance metrics
 /*app.get(
   "/api/admin/staff/metrics",
@@ -2110,431 +2210,162 @@ app.get(
   },
 );
 
-// ===== ORDERS ROUTES =====
+
 
 /*app.post("/api/orders", authMiddleware, async (req, res) => {
   try {
-    const {
-      items,
-      total,
-      delivery_address,
-      notes,
-      delivery_phone,
-      delivery_instructions,
-    } = req.body;
+    const { items, delivery_address, delivery_phone, delivery_instructions, notes } = req.body;
+
+    // Idempotency key: header first (once app.js sends one — see the
+    // frontend patch), falling back to a per-request UUID so this
+    // route still works before that frontend change ships. A
+    // fallback key protects nothing (it's different every call) but
+    // costs nothing either — real double-tap protection starts
+    // working the moment the frontend sends a stable key.
+    const idempotencyKey = req.headers["idempotency-key"] || uuidv4();
 
     if (!items || !items.length) {
-      return res.status(400).json({
-        success: false,
-        message: "Order must contain items",
-      });
+      return res.status(400).json({ success: false, message: "Order must contain items" });
     }
 
-    const orderTotal =
-      total || items.reduce((sum, i) => sum + i.price * i.quantity, 0);
-    const orderId = `FZ-${Date.now().toString().slice(-6)}`;
+    // Client sends {id, quantity} per item (and, harmlessly, price/name —
+    // ignored entirely). create_and_pay_order() re-fetches every price
+    // from menu_items itself; nothing from req.body ever reaches the
+    // ledger.
+    const itemsForFn = items.map((i) => ({ id: i.id, quantity: i.quantity }));
 
-    // ✅ STEP 1: Check user balance FIRST
-    const { data: user, error: userError } = await supabase
-      .from("users")
-      .select("balance")
-      .eq("id", req.userId)
-      .single();
+    const { data: result, error } = await supabase.rpc("create_and_pay_order", {
+      p_idempotency_key: idempotencyKey,
+      p_user_id: req.userId,
+      p_items: itemsForFn,
+      p_delivery_address: delivery_address || null,
+      p_delivery_phone: delivery_phone || null,
+      p_delivery_instructions: delivery_instructions || null,
+      p_notes: notes || null,
+    });
 
-    if (userError || !user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-      });
+    if (error) {
+      console.error("create_and_pay_order RPC error:", error);
+      return res.status(500).json({ success: false, message: "Failed to create order" });
     }
 
-    const currentBalance = parseFloat(user.balance);
-
-    if (currentBalance < orderTotal) {
-      return res.status(400).json({
-        success: false,
-        message: "Insufficient balance",
-        required: orderTotal,
-        balance: currentBalance,
-        shortfall: orderTotal - currentBalance,
-      });
+    if (!result.success) {
+      const statusByCode = {
+        EMPTY_CART: 400,
+        INVALID_QUANTITY: 400,
+        ITEM_NOT_FOUND: 400,
+        INVALID_TOTAL: 400,
+        USER_NOT_FOUND: 404,
+        INSUFFICIENT_BALANCE: 400,
+      };
+      return res.status(statusByCode[result.code] || 500).json(result);
     }
 
-    // ✅ STEP 2: Create the order FIRST
-    const orderData = {
-      id: orderId,
-      user_id: req.userId,
-      items: JSON.stringify(items),
-      total: orderTotal,
-      status: "processing",
-      delivery_address: delivery_address || "Store pickup",
-      delivery_phone: delivery_phone || null,
-      delivery_instructions: delivery_instructions || null,
-      notes: notes || "",
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-
-    const { data: order, error: orderError } = await supabase
-      .from("orders")
-      .insert([orderData])
-      .select()
-      .single();
-
-    if (orderError) {
-      console.error("Order creation error:", orderError);
-      return res.status(500).json({
-        success: false,
-        message: "Failed to create order",
-        error: orderError.message,
-      });
-    }
-
-    // ✅ STEP 3: NOW deduct from wallet (order exists, so foreign key works)
-    const reference = generateReference();
-
-    // Get user's current balance again (might have changed)
-    const { data: freshUser, error: freshError } = await supabase
-      .from("users")
-      .select("balance")
-      .eq("id", req.userId)
-      .single();
-
-    if (freshError) {
-      throw freshError;
-    }
-
-    const freshBalance = parseFloat(freshUser.balance);
-
-    // Double-check balance hasn't changed
-    if (freshBalance < orderTotal) {
-      // Rollback: Delete the order
-      await supabase.from("orders").delete().eq("id", orderId);
-      return res.status(400).json({
-        success: false,
-        message: "Insufficient balance. Order cancelled.",
-      });
-    }
-
-    // Create transaction record with the order_id
-    const transactionId = uuidv4();
-    const { error: txError } = await supabase
-      .from("wallet_transactions")
+    // Fire-and-forget notification — matches spec's "financial success
+    // is independent of notification success." Not awaited critically:
+    // if this insert fails, the order is still PAID and the response
+    // below is unaffected. A real outbox/retry worker is a later phase;
+    // this is the minimum viable version of "don't let this block or
+    // fail the financial transaction."
+    supabase
+      .from("payment_notifications")
       .insert([
         {
-          id: transactionId,
           user_id: req.userId,
-          transaction_type: "debit",
-          amount: orderTotal,
-          balance_before: freshBalance,
-          balance_after: freshBalance - orderTotal,
-          reference: reference,
-          description: `Order payment - ${orderId}`,
-          category: "order",
-          order_id: orderId, // ✅ ORDER EXISTS NOW! No foreign key error
-          status: "completed",
+          type: "payment_success",
+          title: "Order Placed Successfully 🎉",
+          message: `Your order #${result.order.id} has been placed. ₦${Number(result.order.total).toFixed(2)} has been deducted from your wallet.`,
+          reference: result.order.id,
           created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
         },
-      ]);
+      ])
+      .then(({ error: notifErr }) => {
+        if (notifErr) console.error("Order notification insert failed (non-fatal):", notifErr);
+      });
 
-    if (txError) {
-      console.error("Transaction creation error:", txError);
-      // Rollback: Delete the order
-      await supabase.from("orders").delete().eq("id", orderId);
-      throw txError;
-    }
-
-    // ✅ STEP 4: Update user's balance
-    const { error: updateError } = await supabase
-      .from("users")
-      .update({
-        balance: freshBalance - orderTotal,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", req.userId);
-
-    if (updateError) {
-      console.error("Balance update error:", updateError);
-      // Rollback: Delete order and transaction
-      await supabase.from("orders").delete().eq("id", orderId);
-      await supabase
-        .from("wallet_transactions")
-        .delete()
-        .eq("id", transactionId);
-      throw updateError;
-    }
-
-    // ✅ STEP 5: Update account ledger
-    await updateAccountLedger(req.userId);
-
-    // ✅ STEP 6: Create notification
-    await supabase.from("payment_notifications").insert([
-      {
-        user_id: req.userId,
-        type: "payment_success",
-        title: "Order Placed Successfully 🎉",
-        message: `Your order #${orderId} has been placed. ₦${orderTotal.toFixed(2)} has been deducted from your wallet.`,
-        reference: orderId,
-        created_at: new Date().toISOString(),
-      },
-    ]);
-
-    res.status(201).json({
+    res.status(result.duplicate ? 200 : 201).json({
       success: true,
-      message: "Order created successfully",
-      order: order,
-      balance_after: freshBalance - orderTotal,
-      transaction_id: transactionId,
+      message: result.duplicate ? "Order already processed" : "Order created successfully",
+      order: result.order,
+      balance_after: result.balance_after,
+      transaction_id: result.transaction_id,
+      ledger_entry_id: result.ledger_entry_id,
     });
   } catch (error) {
     console.error("Order error:", error);
-
-    // Attempt to clean up any orphaned data
-    try {
-      // If there's an order ID but no transaction, delete the order
-      if (orderId) {
-        await supabase.from("orders").delete().eq("id", orderId);
-      }
-    } catch (cleanupError) {
-      console.error("Cleanup error:", cleanupError);
-    }
-
-    res.status(500).json({
-      success: false,
-      message: error.message || "Failed to create order",
-    });
+    res.status(500).json({ success: false, message: error.message || "Failed to create order" });
   }
 });*/
 
-// server.js - Updated POST /api/orders with full ledger
-
 app.post("/api/orders", authMiddleware, async (req, res) => {
   try {
-    const {
-      items,
-      total,
-      delivery_address,
-      notes,
-      delivery_phone,
-      delivery_instructions,
-    } = req.body;
+    const { items, delivery_address, delivery_phone, delivery_instructions, notes } = req.body;
+
+    // Idempotency key: header first (once app.js sends one — see the
+    // frontend patch), falling back to a per-request UUID so this
+    // route still works before that frontend change ships. A
+    // fallback key protects nothing (it's different every call) but
+    // costs nothing either — real double-tap protection starts
+    // working the moment the frontend sends a stable key.
+    const idempotencyKey = req.headers["idempotency-key"] || uuidv4();
 
     if (!items || !items.length) {
-      return res.status(400).json({
-        success: false,
-        message: "Order must contain items",
-      });
+      return res.status(400).json({ success: false, message: "Order must contain items" });
     }
 
-    const orderTotal =
-      total || items.reduce((sum, i) => sum + i.price * i.quantity, 0);
-    const orderId = `FZ-${Date.now().toString().slice(-6)}`;
+    // Client sends {id, quantity} per item (and, harmlessly, price/name —
+    // ignored entirely). create_and_pay_order() re-fetches every price
+    // from menu_items itself; nothing from req.body ever reaches the
+    // ledger.
+    const itemsForFn = items.map((i) => ({ id: i.id, quantity: i.quantity }));
 
-    // STEP 1: Check user balance
-    const { data: user, error: userError } = await supabase
-      .from("users")
-      .select("balance")
-      .eq("id", req.userId)
-      .single();
-
-    if (userError || !user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-      });
-    }
-
-    const currentBalance = parseFloat(user.balance);
-
-    if (currentBalance < orderTotal) {
-      return res.status(400).json({
-        success: false,
-        message: "Insufficient balance",
-        required: orderTotal,
-        balance: currentBalance,
-        shortfall: orderTotal - currentBalance,
-      });
-    }
-
-    // STEP 2: Create order
-    const orderData = {
-      id: orderId,
-      user_id: req.userId,
-      items: JSON.stringify(items),
-      total: orderTotal,
-      status: "processing",
-      delivery_address: delivery_address || "Store pickup",
-      delivery_phone: delivery_phone || null,
-      delivery_instructions: delivery_instructions || null,
-      notes: notes || "",
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-
-    const { data: order, error: orderError } = await supabase
-      .from("orders")
-      .insert([orderData])
-      .select()
-      .single();
-
-    if (orderError) {
-      console.error("Order creation error:", orderError);
-      return res.status(500).json({
-        success: false,
-        message: "Failed to create order",
-        error: orderError.message,
-      });
-    }
-
-    // STEP 3: Create double-entry ledger entries
-    const reference = generateReference();
-
-    // Get user's current balance for transaction
-    const { data: freshUser } = await supabase
-      .from("users")
-      .select("balance")
-      .eq("id", req.userId)
-      .single();
-
-    const freshBalance = parseFloat(freshUser.balance);
-
-    // Create ledger entry with double-entry
-    const ledgerResult = await createLedgerEntry({
-      description: `Order #${orderId} - ${items.length} items`,
-      referenceType: "order",
-      referenceId: orderId,
-      createdBy: req.userId,
-      entries: [
-        {
-          // Debit: User Wallet (money leaves user)
-          accountCode: "2000", // User Wallet Liability
-          userId: req.userId,
-          debit: orderTotal,
-          credit: 0,
-          description: `Order payment for #${orderId}`,
-        },
-        {
-          // Credit: Frozyla Revenue (money enters company)
-          accountCode: "1001", // Frozyla Revenue Account
-          userId: null, // Company account
-          debit: 0,
-          credit: orderTotal,
-          description: `Revenue from order #${orderId}`,
-        },
-      ],
+    const { data: result, error } = await supabase.rpc("create_and_pay_order", {
+      p_idempotency_key: idempotencyKey,
+      p_user_id: req.userId,
+      p_items: itemsForFn,
+      p_delivery_address: delivery_address || null,
+      p_delivery_phone: delivery_phone || null,
+      p_delivery_instructions: delivery_instructions || null,
+      p_notes: notes || null,
     });
 
-    if (!ledgerResult || ledgerResult.error) {
-      // Rollback order
-      await supabase.from("orders").delete().eq("id", orderId);
-      throw new Error("Failed to create ledger entry");
+    if (error) {
+      console.error("create_and_pay_order RPC error:", error);
+      return res.status(500).json({ success: false, message: "Failed to create order" });
     }
 
-    // STEP 4: Update user's balance
-    const { error: updateError } = await supabase
-      .from("users")
-      .update({
-        balance: freshBalance - orderTotal,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", req.userId);
-
-    if (updateError) {
-      // Rollback: Delete order and ledger entries
-      await supabase.from("orders").delete().eq("id", orderId);
-      await supabase
-        .from("ledger_entries")
-        .delete()
-        .eq("id", ledgerResult.entry.id);
-      throw updateError;
+    if (!result.success) {
+      const statusByCode = {
+        EMPTY_CART: 400,
+        INVALID_QUANTITY: 400,
+        ITEM_NOT_FOUND: 400,
+        INVALID_TOTAL: 400,
+        USER_NOT_FOUND: 404,
+        INSUFFICIENT_BALANCE: 400,
+      };
+      return res.status(statusByCode[result.code] || 500).json(result);
     }
 
-    // STEP 5: Create wallet transaction record
-    const transactionId = uuidv4();
-    await supabase.from("wallet_transactions").insert([
-      {
-        id: transactionId,
-        user_id: req.userId,
-        transaction_type: "debit",
-        amount: orderTotal,
-        balance_before: freshBalance,
-        balance_after: freshBalance - orderTotal,
-        reference: reference,
-        description: `Order payment - ${orderId}`,
-        category: "order",
-        order_id: orderId,
-        ledger_entry_id: ledgerResult.entry.id,
-        status: "completed",
-        created_at: new Date().toISOString(),
-        completed_at: new Date().toISOString(),
-      },
-    ]);
+    // Notification is no longer inserted here directly — it's now a
+    // retryable background_jobs row (send_push_notification), fanned
+    // out from the ORDER_PAID outbox event create_and_pay_order()
+    // writes atomically alongside the order itself (see 008 and
+    // frozyla-job-worker.js). A cron-triggered worker batch picks it
+    // up within seconds; no code in this route needs to know that.
 
-    // STEP 6: Create notification
-    await supabase.from("payment_notifications").insert([
-      {
-        user_id: req.userId,
-        type: "payment_success",
-        title: "Order Placed Successfully 🎉",
-        message: `Your order #${orderId} has been placed. ₦${orderTotal.toFixed(2)} has been deducted from your wallet.`,
-        reference: orderId,
-        created_at: new Date().toISOString(),
-      },
-    ]);
-
-    res.status(201).json({
+    res.status(result.duplicate ? 200 : 201).json({
       success: true,
-      message: "Order created successfully",
-      order: order,
-      balance_after: freshBalance - orderTotal,
-      transaction_id: transactionId,
-      ledger_entry_id: ledgerResult.entry.id,
+      message: result.duplicate ? "Order already processed" : "Order created successfully",
+      order: result.order,
+      balance_after: result.balance_after,
+      transaction_id: result.transaction_id,
+      ledger_entry_id: result.ledger_entry_id,
     });
   } catch (error) {
     console.error("Order error:", error);
-    res.status(500).json({
-      success: false,
-      message: error.message || "Failed to create order",
-    });
+    res.status(500).json({ success: false, message: error.message || "Failed to create order" });
   }
 });
-
-// server.js - Add rollback helper
-
-/*async function rollbackOrder(orderId, transactionId) {
-    const errors = [];
-    
-    try {
-        if (transactionId) {
-            const { error } = await supabase
-                .from("wallet_transactions")
-                .delete()
-                .eq("id", transactionId);
-            if (error) errors.push({ table: 'wallet_transactions', error });
-        }
-    } catch (e) {
-        errors.push({ table: 'wallet_transactions', error: e });
-    }
-
-    try {
-        if (orderId) {
-            const { error } = await supabase
-                .from("orders")
-                .delete()
-                .eq("id", orderId);
-            if (error) errors.push({ table: 'orders', error });
-        }
-    } catch (e) {
-        errors.push({ table: 'orders', error: e });
-    }
-
-    if (errors.length > 0) {
-        console.error('Rollback errors:', errors);
-    }
-    
-    return errors;
-}*/
 
 app.get("/api/orders", authMiddleware, async (req, res) => {
   try {
@@ -2595,7 +2426,7 @@ app.get("/api/orders/:id", authMiddleware, async (req, res) => {
   }
 });
 
-app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
+/*app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -2643,6 +2474,55 @@ app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
       success: false,
       message: "Internal server error",
     });
+  }
+});*/
+
+app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, reason } = req.body;
+    const isAdmin = req.userRole === "admin";
+
+    // Customers may only ever request cancellation. Admins/staff get
+    // the full lifecycle via the admin route below, not this one.
+    if (!isAdmin && status !== "CANCELLATION_PENDING") {
+      return res.status(403).json({
+        success: false,
+        message: "Customers can only request cancellation. Use the admin endpoint for other status changes.",
+      });
+    }
+
+    if (!isAdmin) {
+      // Ownership check stays — transition_order_status() itself
+      // doesn't know or care who's asking, only whether the
+      // FROM->TO transition is valid.
+      const { data: order } = await supabase.from("orders").select("user_id").eq("id", id).maybeSingle();
+      if (!order || order.user_id !== req.userId) {
+        return res.status(404).json({ success: false, message: "Order not found" });
+      }
+    }
+
+    const { data: result, error } = await supabase.rpc("transition_order_status", {
+      p_order_id: id,
+      p_new_status: status,
+      p_actor_type: isAdmin ? "admin" : "customer",
+      p_actor_id: req.userId,
+      p_reason: reason || null,
+    });
+
+    if (error) {
+      console.error("transition_order_status RPC error:", error);
+      return res.status(500).json({ success: false, message: "Failed to update order" });
+    }
+    if (!result.success) {
+      const statusCode = result.code === "ORDER_NOT_FOUND" ? 404 : 400;
+      return res.status(statusCode).json(result);
+    }
+
+    res.json({ success: true, message: "Order updated", ...result });
+  } catch (error) {
+    console.error("Order update error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
   }
 });
 
