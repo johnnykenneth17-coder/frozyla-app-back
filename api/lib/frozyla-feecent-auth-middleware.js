@@ -55,11 +55,16 @@ async function verifyFeecentSignature(req, res, next) {
   const nonce = req.headers["x-feecent-nonce"];
   const signature = req.headers["x-feecent-signature"];
   const rawBody = req.rawBody || "";
+  // req.path is relative to wherever this middleware is mounted (it
+  // would read "/verify" here, not the full path) — req.originalUrl
+  // is the actual full path as received, which is what FEECENT signs
+  // against. Strip the query string in case one is ever present.
+  const path = req.originalUrl.split("?")[0];
 
   const { valid, reason } = hmac.verify({
     secret: HMAC_SECRET,
     method: req.method,
-    path: req.path, // path only — see frozyla-hmac.js's normalization note
+    path,
     timestamp,
     nonce,
     rawBody,
