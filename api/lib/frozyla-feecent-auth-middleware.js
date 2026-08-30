@@ -25,6 +25,17 @@ const hmac = require("./frozyla-hmac");
 
 const HMAC_SECRET = process.env.FROZYLA_FEECENT_HMAC_SECRET;
 
+// TEMPORARY DIAGNOSTIC — remove once the env var issue is confirmed
+// fixed. Logs presence/length only, never the actual secret value.
+console.log(
+  "[DIAGNOSTIC] FROZYLA_FEECENT_HMAC_SECRET present:",
+  !!HMAC_SECRET,
+  "| length:",
+  (HMAC_SECRET || "").length,
+  "| all env keys containing FROZYLA or HMAC:",
+  Object.keys(process.env).filter((k) => k.includes("FROZYLA") || k.includes("HMAC")),
+);
+
 if (!HMAC_SECRET) {
   console.warn(
     "[FROZYLA-FEECENT-AUTH] FROZYLA_FEECENT_HMAC_SECRET not set — every " +
