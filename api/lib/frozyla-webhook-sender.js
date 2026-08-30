@@ -20,7 +20,7 @@ const crypto = require("crypto");
 const hmac = require("./frozyla-hmac");
 
 const FEECENT_WEBHOOK_URL = process.env.FEECENT_WEBHOOK_URL; // e.g. https://api.feecent.com/api/webhooks/frozyla
-const HMAC_SECRET = process.env.FROZYLA_FEECENT_HMAC_SECRET; // same value as FEECENT's FEECENT_FROZYLA_HMAC_SECRET
+const HMAC_SECRET = process.env.FEECENT_FROZYLA_HMAC_SECRET; // same value as FEECENT's own FEECENT_FROZYLA_HMAC_SECRET
 const REQUEST_TIMEOUT_MS = 10000;
 
 // status: 'success' | 'failed' | 'pending'

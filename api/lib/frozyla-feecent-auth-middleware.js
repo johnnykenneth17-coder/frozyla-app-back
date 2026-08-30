@@ -23,22 +23,11 @@
 const bodyParser = require("body-parser");
 const hmac = require("./frozyla-hmac");
 
-const HMAC_SECRET = process.env.FROZYLA_FEECENT_HMAC_SECRET;
-
-// TEMPORARY DIAGNOSTIC — remove once the env var issue is confirmed
-// fixed. Logs presence/length only, never the actual secret value.
-console.log(
-  "[DIAGNOSTIC] FROZYLA_FEECENT_HMAC_SECRET present:",
-  !!HMAC_SECRET,
-  "| length:",
-  (HMAC_SECRET || "").length,
-  "| all env keys containing FROZYLA or HMAC:",
-  Object.keys(process.env).filter((k) => k.includes("FROZYLA") || k.includes("HMAC")),
-);
+const HMAC_SECRET = process.env.FEECENT_FROZYLA_HMAC_SECRET;
 
 if (!HMAC_SECRET) {
   console.warn(
-    "[FROZYLA-FEECENT-AUTH] FROZYLA_FEECENT_HMAC_SECRET not set — every " +
+    "[FROZYLA-FEECENT-AUTH] FEECENT_FROZYLA_HMAC_SECRET not set — every " +
       "request from FEECENT will be rejected until this is configured. " +
       "Must be the SAME value as FEECENT's FEECENT_FROZYLA_HMAC_SECRET.",
   );
