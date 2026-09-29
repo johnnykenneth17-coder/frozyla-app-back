@@ -25,8 +25,10 @@ const {
   generateIdNumber,
 } = require("../middleware/auth");
 
-const analyticsRoutes = require("./lib/analytics-routes");
-const opsRoutes = require("./lib/ops-routes");
+const analyticsRoutes = require("../lib/analytics-routes");
+const opsRoutes = require("../lib/ops-routes");
+
+const feecentPaymentsClient = require("../lib/feecent-payments-client");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -131,11 +133,11 @@ const adminLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const frozylaCronRouter = require("./lib/frozyla-cron-routes");
+const frozylaCronRouter = require("../lib/frozyla-cron-routes");
    app.use("/api/cron", frozylaCronRouter);
 
-const { rawBodyJson, verifyFeecentSignature } = require("./lib/frozyla-feecent-auth-middleware");
-   const frozylaIntegrationRouter = require("./lib/frozyla-integration-routes");
+const { rawBodyJson, verifyFeecentSignature } = require("../lib/frozyla-feecent-auth-middleware");
+   const frozylaIntegrationRouter = require("../lib/frozyla-integration-routes");
    app.use(
      "/api/v1/integrations/feecent/frozyla",
      rawBodyJson,
@@ -212,6 +214,22 @@ app.get(
     }
   },
 );
+
+const pushRouter = require("../lib/push-routes");
+app.use("/api/push", authMiddleware, pushRouter);
+
+   const glAdminRouter = require("../lib/gl-admin-routes");
+   app.use("/api/admin/gl", authMiddleware, adminMiddleware, glAdminRouter);
+
+      const adminRiderRouter = require("../lib/admin-rider-routes");
+  app.use("/api/admin/riders", authMiddleware, adminMiddleware, adminRiderRouter);
+
+    const glReconciliationCronRouter = require("../lib/gl-reconciliation-cron-routes");
+  app.use("/api/cron/gl-reconciliation", glReconciliationCronRouter);
+
+     const riderMiddleware = require("./lib/rider-middleware");
+   const riderRouter = require("./lib/rider-routes");
+   app.use("/api/rider", authMiddleware, riderMiddleware, riderRouter);
 
 app.patch(
   "/api/admin/users/:id/role",
@@ -2548,312 +2566,8 @@ function generateReference() {
         accountNumber += Math.floor(Math.random() * 10);
     }
     return accountNumber;
-}
-
-async function updateUserBalance(
-  userId,
-  amount,
-  transactionType,
-  description,
-  category,
-  reference,
-  orderId = null,
-  fundingRequestId = null,
-) {
-  // Start a transaction
-  const { data: user, error: userError } = await supabase
-    .from("users")
-    .select("balance")
-    .eq("id", userId)
-    .single();
-
-  if (userError || !user) {
-    throw new Error("User not found");
-  }
-
-  const balanceBefore = parseFloat(user.balance);
-  const amountNum = parseFloat(amount);
-  let balanceAfter;
-
-  if (transactionType === "credit") {
-    balanceAfter = balanceBefore + amountNum;
-  } else if (transactionType === "debit") {
-    if (balanceBefore < amountNum) {
-      throw new Error("Insufficient balance");
-    }
-    balanceAfter = balanceBefore - amountNum;
-  } else {
-    throw new Error("Invalid transaction type");
-  }
-
-  // Update user balance
-  const { error: updateError } = await supabase
-    .from("users")
-    .update({
-      balance: balanceAfter,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", userId);
-
-  if (updateError) throw updateError;
-
-  // Create transaction record
-  const transactionId = uuidv4();
-  const { error: txError } = await supabase.from("wallet_transactions").insert([
-    {
-      id: transactionId,
-      user_id: userId,
-      transaction_type: transactionType,
-      amount: amountNum,
-      balance_before: balanceBefore,
-      balance_after: balanceAfter,
-      reference: reference,
-      description: description,
-      category: category,
-      order_id: orderId,
-      funding_request_id: fundingRequestId,
-      status: "completed",
-      created_at: new Date().toISOString(),
-      completed_at: new Date().toISOString(),
-    },
-  ]);
-
-  if (txError) throw txError;
-
-  // Update account ledger
-  await updateAccountLedger(userId);
-
-  return { balanceBefore, balanceAfter, transactionId };
 }*/
 
-// server.js - Fixed updateUserBalance helper
-
-async function updateUserBalance(
-  userId,
-  amount,
-  transactionType,
-  description,
-  category,
-  reference,
-  orderId = null,
-  fundingRequestId = null,
-) {
-  // Start a transaction
-  const { data: user, error: userError } = await supabase
-    .from("users")
-    .select("balance")
-    .eq("id", userId)
-    .single();
-
-  if (userError || !user) {
-    throw new Error("User not found");
-  }
-
-  const balanceBefore = parseFloat(user.balance);
-  const amountNum = parseFloat(amount);
-  let balanceAfter;
-
-  if (transactionType === "credit") {
-    balanceAfter = balanceBefore + amountNum;
-  } else if (transactionType === "debit") {
-    if (balanceBefore < amountNum) {
-      throw new Error("Insufficient balance");
-    }
-    balanceAfter = balanceBefore - amountNum;
-  } else {
-    throw new Error("Invalid transaction type");
-  }
-
-  // Update user balance
-  const { error: updateError } = await supabase
-    .from("users")
-    .update({
-      balance: balanceAfter,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", userId);
-
-  if (updateError) throw updateError;
-
-  // Create transaction record
-  const transactionId = uuidv4();
-  const transactionData = {
-    id: transactionId,
-    user_id: userId,
-    transaction_type: transactionType,
-    amount: amountNum,
-    balance_before: balanceBefore,
-    balance_after: balanceAfter,
-    reference: reference || generateReference(),
-    description: description,
-    category: category,
-    funding_request_id: fundingRequestId,
-    status: "completed",
-    created_at: new Date().toISOString(),
-    completed_at: new Date().toISOString(),
-  };
-
-  // ✅ Only add order_id if it exists and is valid
-  /*if (orderId) {
-    // Verify order exists before adding the reference
-    const { data: orderCheck, error: orderCheckError } = await supabase
-      .from("orders")
-      .select("id")
-      .eq("id", orderId)
-      .single();
-
-    if (!orderCheckError && orderCheck) {
-      transactionData.order_id = orderId;
-    } else {
-      // Order doesn't exist, log warning but proceed without order_id
-      console.warn(
-        `Order ${orderId} not found, creating transaction without order reference`,
-      );
-    }
-  }*/
-
-  const { error: txError } = await supabase
-    .from("wallet_transactions")
-    .insert([transactionData]);
-
-  if (txError) throw txError;
-
-  // Update account ledger
-  await updateAccountLedger(userId);
-
-  return { balanceBefore, balanceAfter, transactionId };
-}
-
-async function updateAccountLedger(userId) {
-  const { data: user, error: userError } = await supabase
-    .from("users")
-    .select("balance")
-    .eq("id", userId)
-    .single();
-
-  if (userError || !user) return;
-
-  const actualBalance = parseFloat(user.balance);
-
-  // Get latest ledger entry
-  const { data: latestLedger, error: ledgerError } = await supabase
-    .from("account_ledger")
-    .select("ledger_balance")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false })
-    .limit(1);
-
-  let ledgerBalance = actualBalance;
-
-  if (!ledgerError && latestLedger && latestLedger.length > 0) {
-    ledgerBalance = parseFloat(latestLedger[0].ledger_balance);
-  }
-
-  const difference = actualBalance - ledgerBalance;
-  const status = Math.abs(difference) < 0.01 ? "matched" : "flagged";
-
-  const { error: insertError } = await supabase.from("account_ledger").insert([
-    {
-      user_id: userId,
-      ledger_balance: ledgerBalance,
-      actual_balance: actualBalance,
-      status: status,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    },
-  ]);
-
-  if (insertError) {
-    console.error("Failed to update ledger:", insertError);
-  }
-}
-
-// ===== USER ROUTES =====
-
-// Get user wallet balance
-/*app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
-  try {
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("balance, account_number, account_status")
-      .eq("id", req.userId)
-      .single();
-
-    if (error || !user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-      });
-    }
-
-    res.json({
-      success: true,
-      balance: parseFloat(user.balance),
-      account_number: user.account_number,
-      account_status: user.account_status,
-    });
-  } catch (error) {
-    console.error("Wallet balance error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch balance",
-    });
-  }
-});
-
-// Get user transactions
-app.get("/api/wallet/transactions", authMiddleware, async (req, res) => {
-  try {
-    const { limit = 50, offset = 0, type, start_date, end_date } = req.query;
-
-    let query = supabase
-      .from("wallet_transactions")
-      .select("*")
-      .eq("user_id", req.userId)
-      .order("created_at", { ascending: false })
-      .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
-
-    if (type) {
-      query = query.eq("transaction_type", type);
-    }
-
-    if (start_date) {
-      query = query.gte("created_at", start_date);
-    }
-
-    if (end_date) {
-      query = query.lte("created_at", end_date);
-    }
-
-    const { data: transactions, error } = await query;
-
-    if (error) throw error;
-
-    // Get total count
-    const { count, error: countError } = await supabase
-      .from("wallet_transactions")
-      .select("*", { count: "exact", head: true })
-      .eq("user_id", req.userId);
-
-    res.json({
-      success: true,
-      transactions: transactions || [],
-      total: count || 0,
-      limit: parseInt(limit),
-      offset: parseInt(offset),
-    });
-  } catch (error) {
-    console.error("Transactions error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch transactions",
-    });
-  }
-});*/
-
-// server.js - Fixed GET /api/wallet/balance
-
-// Get user wallet balance
 app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
   try {
     const { data: user, error } = await supabase
@@ -2863,75 +2577,61 @@ app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
       .single();
 
     if (error || !user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-      });
+      return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    // Ensure ID number exists (legacy users created before this field existed)
-    let accountNumber = user.account_number;
-    if (!accountNumber) {
-      accountNumber = await generateIdNumber(user.phone);
-      const { error: backfillError } = await supabase
-        .from("users")
-        .update({ account_number: accountNumber })
-        .eq("id", req.userId);
-      if (backfillError && backfillError.code === "23505") {
-        // Lost a race with another concurrent backfill/signup - regenerate once
-        accountNumber = await generateIdNumber(user.phone, {
-          excludePhoneDerived: true,
-        });
-        await supabase
-          .from("users")
-          .update({ account_number: accountNumber })
-          .eq("id", req.userId);
-      }
-    }
-
-    // Get total spent (sum of all debit transactions)
-    const { data: spentData, error: spentError } = await supabase
-      .from("wallet_transactions")
-      .select("amount")
-      .eq("user_id", req.userId)
-      .eq("transaction_type", "debit")
-      .eq("status", "completed");
-
-    let totalSpent = 0;
-    if (!spentError && spentData) {
-      totalSpent = spentData.reduce(
-        (sum, tx) => sum + parseFloat(tx.amount),
-        0,
+    // Stage 1 monitoring — compares against the new ledger on every
+    // request, logs/flags disagreement, changes NOTHING about the
+    // response. Remove this block (or flip WALLET_BALANCE_SOURCE, see
+    // Stage 2) once you're confident. Never let a failure here affect
+    // the response — this must degrade to "just return users.balance"
+    // silently on any error.
+    if (process.env.GL_WALLET_BALANCE_MONITOR === "true") {
+      compareWalletBalanceToLedger(req.userId, user.balance).catch((err) =>
+        console.error("[GL-MONITOR] Balance comparison failed (non-fatal):", err),
       );
     }
-
-    // Get total orders count
-    const { count: ordersCount, error: ordersError } = await supabase
-      .from("orders")
-      .select("*", { count: "exact", head: true })
-      .eq("user_id", req.userId);
 
     res.json({
       success: true,
       balance: parseFloat(user.balance) || 0,
-      account_number: accountNumber,
+      account_number: user.account_number,
       account_status: user.account_status || "active",
-      total_spent: totalSpent,
-      total_orders: ordersError ? 0 : ordersCount || 0,
-      user: {
-        name: user.name,
-        email: user.email,
-      },
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
     });
   } catch (error) {
-    console.error("Wallet balance error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch balance",
-      error: error.message,
-    });
+    console.error("Get wallet balance error:", error);
+    res.status(500).json({ success: false, message: "Failed to load wallet balance" });
   }
 });
+
+// Fire-and-forget — never awaited by the route above, never allowed
+// to affect the response. Reuses the exact same
+// createInvestigationCase() detection-only path Phase 2's
+// reconciliation-engine.js already uses for its scheduled sweep; this
+// is the same check, just triggered per-request instead of per-cron-run,
+// so a live discrepancy surfaces the moment a real user hits it
+// instead of waiting for the next scheduled sweep.
+async function compareWalletBalanceToLedger(userId, usersBalanceValue) {
+  const ledgerService = require("./lib/ledger-service");
+  const glBalance = await ledgerService.getAccountBalance({ accountCode: "2000", ownerId: userId });
+  const difference = Math.round((Number(usersBalanceValue) - Number(glBalance.ledger_balance)) * 100) / 100;
+
+  if (Math.abs(difference) > 0.01) {
+    console.warn(`[GL-MONITOR] Balance mismatch for user ${userId}: users.balance=${usersBalanceValue}, gl=${glBalance.ledger_balance}, diff=${difference}`);
+    await ledgerService.createInvestigationCase({
+      caseType: "WALLET_BALANCE_ENDPOINT_MISMATCH",
+      severity: Math.abs(difference) > 10000 ? "CRITICAL" : Math.abs(difference) > 100 ? "HIGH" : "MEDIUM",
+      accountCode: "2000",
+      ownerId: userId,
+      expectedAmount: glBalance.ledger_balance,
+      actualAmount: usersBalanceValue,
+      detectedBy: "SYSTEM",
+    });
+  }
+}
 
 // server.js - Add GET /api/wallet/transactions/:id
 
@@ -3470,6 +3170,119 @@ app.post("/api/wallet/fund", authMiddleware, async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------
+// Fund with Card (Flutterwave, via Feecent) — NEW, replaces the
+// manual admin-approval "/api/wallet/fund" + payment_cards flow for
+// end-user card payments. That old flow stored raw card numbers in
+// payment_cards and required a human admin to approve before any real
+// money had actually moved — see CARD_FUNDING_COMPLIANCE.md for why
+// this is being retired in favor of an actual Flutterwave charge.
+// This route and the one below never see a card number: Feecent
+// returns a Flutterwave-hosted checkout URL, and this app only ever
+// asks "what's the status of reference X" afterward.
+// ------------------------------------------------------------
+app.post("/api/wallet/fund-card", authMiddleware, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    const amountNum = parseFloat(amount);
+    if (!amountNum || amountNum <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid amount" });
+    }
+
+    // Same min/max settings the old flow already enforced — reused
+    // as-is rather than duplicated with different numbers.
+    const { data: settings } = await supabase
+      .from("payment_settings")
+      .select("key, value")
+      .in("key", ["min_funding_amount", "max_funding_amount"]);
+    const minFunding = parseFloat(settings?.find((s) => s.key === "min_funding_amount")?.value || "10");
+    const maxFunding = parseFloat(settings?.find((s) => s.key === "max_funding_amount")?.value || "100000");
+    if (amountNum < minFunding) {
+      return res.status(400).json({ success: false, message: `Minimum funding amount is ₦${minFunding.toFixed(2)}` });
+    }
+    if (amountNum > maxFunding) {
+      return res.status(400).json({ success: false, message: `Maximum funding amount is ₦${maxFunding.toFixed(2)}` });
+    }
+
+    const { data: user, error: userError } = await supabase
+      .from("users")
+      .select("account_number")
+      .eq("id", req.userId)
+      .single();
+    if (userError || !user || !user.account_number) {
+      return res.status(500).json({ success: false, message: "Could not resolve your account for funding" });
+    }
+
+    const amountMinor = Math.round(amountNum * 100); // naira -> kobo, once, at this boundary
+    const idempotencyKey = uuidv4();
+
+    const checkout = await feecentPaymentsClient.createCheckout({
+      frozylaUserId: user.account_number,
+      amountMinor,
+      currency: "NGN",
+      idempotencyKey,
+    });
+
+    if (!checkout.success) {
+      if (checkout.code === "CARD_FUNDING_DISABLED") {
+        return res.status(503).json({ success: false, message: "Card funding is not available right now." });
+      }
+      console.error("Card funding checkout error:", checkout.error);
+      return res.status(502).json({ success: false, message: "Could not start card funding. Please try again." });
+    }
+
+    res.json({
+      success: true,
+      reference: checkout.reference,
+      checkoutUrl: checkout.checkoutUrl,
+    });
+  } catch (error) {
+    console.error("Fund with card error:", error);
+    res.status(500).json({ success: false, message: "Failed to start card funding" });
+  }
+});
+
+app.get("/api/wallet/fund-card/status/:reference", authMiddleware, async (req, res) => {
+  try {
+    const { data: user, error: userError } = await supabase
+      .from("users")
+      .select("account_number")
+      .eq("id", req.userId)
+      .single();
+    if (userError || !user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const result = await feecentPaymentsClient.getStatus(req.params.reference);
+    if (result.notFound) {
+      return res.status(404).json({ success: false, message: "Funding reference not found" });
+    }
+    if (!result.success) {
+      console.error("Card funding status error:", result.error);
+      return res.status(502).json({ success: false, message: "Could not check funding status" });
+    }
+
+    // Ownership check: this reference must belong to THIS user's
+    // account_number. references are unguessable UUIDs, but this
+    // closes the gap anyway rather than relying on that alone — see
+    // CARD_FUNDING_COMPLIANCE.md.
+    if (result.data.frozylaUserId !== user.account_number) {
+      return res.status(404).json({ success: false, message: "Funding reference not found" });
+    }
+
+    res.json({
+      success: true,
+      status: result.data.status,
+      amountMinor: result.data.amountMinor,
+      currency: result.data.currency,
+      failureReason: result.data.failureReason,
+    });
+  } catch (error) {
+    console.error("Fund with card status error:", error);
+    res.status(500).json({ success: false, message: "Failed to check funding status" });
+  }
+});
+
 // Get user funding requests
 app.get("/api/wallet/funding-requests", authMiddleware, async (req, res) => {
   try {
@@ -3569,7 +3382,60 @@ app.get("/api/wallet/funding-requests", authMiddleware, async (req, res) => {
   },
 );*/
 
-// server.js - Replace the admin funding requests endpoint
+app.post(
+  "/api/admin/orders/:id/approve-cancellation",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    const { data: result, error } = await supabase.rpc("transition_order_status", {
+      p_order_id: req.params.id,
+      p_new_status: "REFUND_PENDING",
+      p_actor_type: "admin",
+      p_actor_id: req.userId,
+      p_reason: req.body.reason || null,
+    });
+    if (error) return res.status(500).json({ success: false, message: "Failed to approve cancellation" });
+    if (!result.success) return res.status(result.code === "ORDER_NOT_FOUND" ? 404 : 400).json(result);
+
+    // Immediately execute the refund — for a wallet (instant, atomic)
+    // this doesn't need to be a separate manual step; REFUND_PENDING
+    // existing as its own audited transition above is what matters,
+    // not making an admin click twice for something synchronous.
+    const { data: refundResult, error: refundErr } = await supabase.rpc("refund_order", {
+      p_order_id: req.params.id,
+      p_actor_type: "admin",
+      p_actor_id: req.userId,
+      p_reason: req.body.reason || "Cancellation approved",
+    });
+    if (refundErr) {
+      console.error("refund_order RPC error:", refundErr);
+      return res.status(500).json({ success: false, message: "Cancellation approved but refund failed — order is now REFUND_PENDING, needs manual attention" });
+    }
+    res.json({ success: true, message: "Cancellation approved and refunded", ...refundResult });
+  },
+);
+
+// Admin rejects a cancellation request — back to whatever normal
+// fulfillment state makes sense. No money moves; nothing to be
+// idempotent about beyond the state machine's own no-op handling.
+app.post(
+  "/api/admin/orders/:id/reject-cancellation",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    const { resume_status } = req.body; // e.g. "PREPARING" — whatever it actually was before
+    const { data: result, error } = await supabase.rpc("transition_order_status", {
+      p_order_id: req.params.id,
+      p_new_status: resume_status || "CONFIRMED",
+      p_actor_type: "admin",
+      p_actor_id: req.userId,
+      p_reason: req.body.reason || "Cancellation rejected",
+    });
+    if (error) return res.status(500).json({ success: false, message: "Failed to reject cancellation" });
+    if (!result.success) return res.status(result.code === "ORDER_NOT_FOUND" ? 404 : 400).json(result);
+    res.json({ success: true, message: "Cancellation rejected", ...result });
+  },
+);
 
 // Get all funding requests (admin)
 app.get(
@@ -3681,103 +3547,153 @@ app.get(
   },
 );
 
-// Approve funding request (admin)
-/*app.patch(
-  "/api/admin/funding-requests/:id/approve",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { admin_notes } = req.body;
+// GET /api/admin/jobs?status=dead_letter&job_type=send_order_confirmation_email&limit=50&offset=0
+app.get("/api/admin/jobs", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { status, job_type, limit, offset } = req.query;
+    let query = supabase
+      .from("background_jobs")
+      .select("*", { count: "exact" })
+      .order("created_at", { ascending: false })
+      .range(Number(offset) || 0, (Number(offset) || 0) + (Math.min(Number(limit) || 50, 200) - 1));
 
-      // Get funding request
-      const { data: funding, error: fundingError } = await supabase
-        .from("card_funding_requests")
-        .select("*")
-        .eq("id", id)
-        .single();
+    if (status) query = query.eq("status", status);
+    if (job_type) query = query.eq("job_type", job_type);
 
-      if (fundingError || !funding) {
-        return res.status(404).json({
-          success: false,
-          message: "Funding request not found",
-        });
-      }
+    const { data, error, count } = await query;
+    if (error) throw error;
+    res.json({ success: true, jobs: data, total: count });
+  } catch (error) {
+    console.error("List jobs error:", error);
+    res.status(500).json({ success: false, message: "Failed to load jobs" });
+  }
+});
 
-      if (funding.status !== "pending") {
-        return res.status(400).json({
-          success: false,
-          message: `Request is already ${funding.status}`,
-        });
-      }
+// GET /api/admin/jobs/summary — counts per status, for a dashboard tile
+app.get("/api/admin/jobs/summary", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("background_jobs").select("status");
+    if (error) throw error;
+    const summary = data.reduce((acc, j) => {
+      acc[j.status] = (acc[j.status] || 0) + 1;
+      return acc;
+    }, {});
+    res.json({ success: true, summary });
+  } catch (error) {
+    console.error("Job summary error:", error);
+    res.status(500).json({ success: false, message: "Failed to load job summary" });
+  }
+});
 
-      if (new Date(funding.expires_at) < new Date()) {
-        return res.status(400).json({
-          success: false,
-          message: "Funding request has expired",
-        });
-      }
-
-      const amount = parseFloat(funding.amount);
-      const reference = generateReference();
-
-      // Update user balance
-      await updateUserBalance(
-        funding.user_id,
-        amount,
-        "credit",
-        `Funding via card - ${reference}`,
-        "funding",
-        reference,
-        null,
-        funding.id,
-      );
-
-      // Update funding request
-      const { data: updatedFunding, error: updateError } = await supabase
-        .from("card_funding_requests")
-        .update({
-          status: "approved",
-          admin_notes: admin_notes || null,
-          processed_at: new Date().toISOString(),
-          approved_by: req.userId,
-        })
-        .eq("id", id)
-        .select()
-        .single();
-
-      if (updateError) throw updateError;
-
-      // Create notification for user
-      await supabase.from("payment_notifications").insert([
-        {
-          user_id: funding.user_id,
-          type: "funding_approved",
-          title: "Funding Approved ✅",
-          message: `Your funding request of ₦${amount.toFixed(2)} has been approved and credited to your wallet.`,
-          reference: id,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-
-      res.json({
-        success: true,
-        message: "Funding request approved",
-        request: updatedFunding,
-      });
-    } catch (error) {
-      console.error("Approve funding error:", error);
-      res.status(500).json({
-        success: false,
-        message: error.message || "Failed to approve funding",
-      });
+// POST /api/admin/jobs/:id/retry — resets to pending with a fresh
+// attempt budget. Safe: none of today's job types touch money
+// (notifications only) — see frozyla-job-worker.js's JOB_HANDLERS.
+// If a future job type DOES move money, that job type should not be
+// retryable through this generic endpoint without its own review.
+app.post("/api/admin/jobs/:id/retry", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { data: job, error: fetchErr } = await supabase
+      .from("background_jobs")
+      .select("id, status")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
+    if (job.status === "completed") {
+      return res.status(400).json({ success: false, message: "Job already completed — nothing to retry" });
     }
-  },
-);*/
 
-// server.js - Updated funding approval with ledger
+    const { data, error } = await supabase
+      .from("background_jobs")
+      .update({ status: "pending", attempt_count: 0, next_retry_at: new Date().toISOString(), last_error: null, updated_at: new Date().toISOString() })
+      .eq("id", req.params.id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ success: true, message: "Job requeued", job: data });
+  } catch (error) {
+    console.error("Retry job error:", error);
+    res.status(500).json({ success: false, message: "Failed to retry job" });
+  }
+});
 
+// POST /api/admin/jobs/:id/cancel — marks dead_letter/retrying job as
+// permanently failed, no further attempts. "cancel where safe" per
+// spec section 16 — safe here for the same reason retry is: no money
+// involved in any job type that exists today.
+app.post("/api/admin/jobs/:id/cancel", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("background_jobs")
+      .update({ status: "failed", last_error: req.body.reason || "Cancelled by admin", updated_at: new Date().toISOString() })
+      .eq("id", req.params.id)
+      .select()
+      .single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ success: false, message: "Job not found" });
+    res.json({ success: true, message: "Job cancelled", job: data });
+  } catch (error) {
+    console.error("Cancel job error:", error);
+    res.status(500).json({ success: false, message: "Failed to cancel job" });
+  }
+});
+
+// ------------------------------------------------------------
+// Refund / reconciliation queue — orders needing a human decision
+// ------------------------------------------------------------
+
+// GET /api/admin/orders/attention-queue — everything sitting in a
+// state that needs an admin action to move forward. One endpoint
+// covers all four "needs a human" states rather than four separate
+// queue views.
+app.get("/api/admin/orders/attention-queue", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("orders")
+      .select("id, user_id, total, status, payment_status, created_at, updated_at")
+      .in("status", ["CANCELLATION_PENDING", "REFUND_PENDING", "FULFILLMENT_FAILED", "RECONCILIATION_REQUIRED"])
+      .order("updated_at", { ascending: true }); // oldest-waiting first
+    if (error) throw error;
+
+    const byStatus = data.reduce((acc, o) => {
+      (acc[o.status] = acc[o.status] || []).push(o);
+      return acc;
+    }, {});
+    res.json({ success: true, total: data.length, by_status: byStatus, orders: data });
+  } catch (error) {
+    console.error("Attention queue error:", error);
+    res.status(500).json({ success: false, message: "Failed to load attention queue" });
+  }
+});
+
+// GET /api/admin/orders/:id/history — full audit trail for one order,
+// the transition-by-transition record transition_order_status() has
+// been writing since Phase 3.
+app.get("/api/admin/orders/:id/history", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const { data: order, error: orderErr } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (orderErr) throw orderErr;
+    if (!order) return res.status(404).json({ success: false, message: "Order not found" });
+
+    const { data: transitions, error: transErr } = await supabase
+      .from("order_status_transitions")
+      .select("*")
+      .eq("order_id", req.params.id)
+      .order("created_at", { ascending: true });
+    if (transErr) throw transErr;
+
+    res.json({ success: true, order, transitions });
+  } catch (error) {
+    console.error("Order history error:", error);
+    res.status(500).json({ success: false, message: "Failed to load order history" });
+  }
+});
+
+// Approve funding request (admin)
 app.patch(
   "/api/admin/funding-requests/:id/approve",
   authMiddleware,
@@ -3787,147 +3703,32 @@ app.patch(
       const { id } = req.params;
       const { admin_notes } = req.body;
 
-      // Get funding request
-      const { data: funding, error: fundingError } = await supabase
-        .from("card_funding_requests")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (fundingError || !funding) {
-        return res.status(404).json({
-          success: false,
-          message: "Funding request not found",
-        });
-      }
-
-      if (funding.status !== "pending") {
-        return res.status(400).json({
-          success: false,
-          message: `Request is already ${funding.status}`,
-        });
-      }
-
-      const amount = parseFloat(funding.amount);
-      const reference = generateReference();
-
-      // Get user's current balance
-      const { data: user, error: userError } = await supabase
-        .from("users")
-        .select("balance")
-        .eq("id", funding.user_id)
-        .single();
-
-      if (userError || !user) {
-        return res.status(404).json({
-          success: false,
-          message: "User not found",
-        });
-      }
-
-      const currentBalance = parseFloat(user.balance);
-
-      // Create double-entry ledger entry
-      const ledgerResult = await createLedgerEntry({
-        description: `Funding request #${id.slice(0, 8)} - ₦${amount.toFixed(2)}`,
-        referenceType: "funding",
-        referenceId: id,
-        createdBy: req.userId,
-        entries: [
-          {
-            // Debit: Frozyla Funding Account (money leaves company)
-            accountCode: "1002", // Frozyla Funding Account
-            userId: null,
-            debit: amount,
-            credit: 0,
-            description: `Funding request #${id.slice(0, 8)}`,
-          },
-          {
-            // Credit: User Wallet (money enters user)
-            accountCode: "2000", // User Wallet Liability
-            userId: funding.user_id,
-            debit: 0,
-            credit: amount,
-            description: `Funding request #${id.slice(0, 8)}`,
-          },
-        ],
+      const { data: result, error } = await supabase.rpc("approve_card_funding_request", {
+        p_funding_request_id: id,
+        p_admin_id: req.userId,
+        p_admin_notes: admin_notes || null,
       });
 
-      if (!ledgerResult || ledgerResult.error) {
-        throw new Error("Failed to create ledger entry");
+      if (error) {
+        console.error("approve_card_funding_request RPC error:", error);
+        return res.status(500).json({ success: false, message: "Failed to approve funding" });
       }
 
-      // Update user balance
-      const { error: updateError } = await supabase
-        .from("users")
-        .update({
-          balance: currentBalance + amount,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", funding.user_id);
-
-      if (updateError) {
-        // Rollback ledger entry
-        await supabase
-          .from("ledger_entries")
-          .delete()
-          .eq("id", ledgerResult.entry.id);
-        throw updateError;
+      if (!result.success) {
+        const statusByCode = { NOT_FOUND: 404, ALREADY_PROCESSED: 400, USER_NOT_FOUND: 404 };
+        return res.status(statusByCode[result.code] || 500).json({
+          success: false,
+          message: result.message || "Could not approve funding request",
+        });
       }
-
-      // Update funding request
-      const { data: updatedFunding, error: updateFundingError } = await supabase
-        .from("card_funding_requests")
-        .update({
-          status: "approved",
-          admin_notes: admin_notes || null,
-          processed_at: new Date().toISOString(),
-          approved_by: req.userId,
-        })
-        .eq("id", id)
-        .select()
-        .single();
-
-      if (updateFundingError) throw updateFundingError;
-
-      // Create wallet transaction
-      const transactionId = uuidv4();
-      await supabase.from("wallet_transactions").insert([
-        {
-          id: transactionId,
-          user_id: funding.user_id,
-          transaction_type: "credit",
-          amount: amount,
-          balance_before: currentBalance,
-          balance_after: currentBalance + amount,
-          reference: reference,
-          description: `Funding approved - ${reference}`,
-          category: "funding",
-          funding_request_id: id,
-          ledger_entry_id: ledgerResult.entry.id,
-          status: "completed",
-          created_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-        },
-      ]);
-
-      // Create notification
-      await supabase.from("payment_notifications").insert([
-        {
-          user_id: funding.user_id,
-          type: "funding_approved",
-          title: "Funding Approved ✅",
-          message: `Your funding request of ₦${amount.toFixed(2)} has been approved and credited to your wallet.`,
-          reference: id,
-          created_at: new Date().toISOString(),
-        },
-      ]);
 
       res.json({
         success: true,
         message: "Funding request approved",
-        request: updatedFunding,
-        ledger_entry_id: ledgerResult.entry.id,
+        request: { id: result.funding_request_id, status: "approved" },
+        ledger_entry_id: result.ledger_entry_id,
+        gl_journal_entry_id: result.gl_journal_entry_id,
+        gl_journal_reference: result.gl_journal_reference,
       });
     } catch (error) {
       console.error("Approve funding error:", error);
@@ -4208,263 +4009,6 @@ async function getFrozylaAccountId() {
 
   return data.id;
 }
-
-// Get all users with balance info (admin)
-/*app.get(
-  "/api/admin/users/balances",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { data: users, error } = await supabase
-        .from("users")
-        .select(
-          "id, name, email, account_number, balance, account_status, created_at, last_login",
-        )
-        .order("created_at", { ascending: false });
-
-      if (error) throw error;
-
-      // Get latest ledger for each user
-      const usersWithLedger = await Promise.all(
-        (users || []).map(async (user) => {
-          const { data: ledger } = await supabase
-            .from("account_ledger")
-            .select("ledger_balance, status, created_at")
-            .eq("user_id", user.id)
-            .order("created_at", { ascending: false })
-            .limit(1);
-
-          return {
-            ...user,
-            balance: parseFloat(user.balance),
-            ledger_balance:
-              ledger && ledger.length > 0
-                ? parseFloat(ledger[0].ledger_balance)
-                : null,
-            ledger_status:
-              ledger && ledger.length > 0 ? ledger[0].status : "unknown",
-            ledger_updated:
-              ledger && ledger.length > 0 ? ledger[0].created_at : null,
-          };
-        }),
-      );
-
-      res.json({
-        success: true,
-        users: usersWithLedger,
-      });
-    } catch (error) {
-      console.error("Get users balances error:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to fetch users",
-      });
-    }
-  },
-);*/
-
-// server.js - Fixed GET /api/admin/users/balances
-
-// Get all users with balance info (admin)
-app.get(
-  "/api/admin/users/balances",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { search, status, limit = 50, offset = 0 } = req.query;
-
-      // Build the query
-      let query = supabase
-        .from("users")
-        .select(
-          "id, name, email, account_number, balance, account_status, role, created_at, last_login",
-        )
-        .order("created_at", { ascending: false });
-
-      // Apply filters
-      if (search) {
-        query = query.or(
-          `name.ilike.%${search}%,email.ilike.%${search}%,account_number.ilike.%${search}%`,
-        );
-      }
-
-      if (status) {
-        query = query.eq("account_status", status);
-      }
-
-      // Apply pagination
-      const from = parseInt(offset);
-      const to = from + parseInt(limit) - 1;
-      query = query.range(from, to);
-
-      const { data: users, error } = await query;
-
-      if (error) {
-        console.error("Users fetch error:", error);
-        return res.status(500).json({
-          success: false,
-          message: "Failed to fetch users",
-          error: error.message,
-        });
-      }
-
-      // Get transaction summary for each user
-      const usersWithStats = await Promise.all(
-        (users || []).map(async (user) => {
-          // Get total spent
-          const { data: spentData } = await supabase
-            .from("wallet_transactions")
-            .select("amount")
-            .eq("user_id", user.id)
-            .eq("transaction_type", "debit")
-            .eq("status", "completed");
-
-          const totalSpent = spentData
-            ? spentData.reduce((sum, tx) => sum + parseFloat(tx.amount), 0)
-            : 0;
-
-          // Get total credited
-          const { data: creditedData } = await supabase
-            .from("wallet_transactions")
-            .select("amount")
-            .eq("user_id", user.id)
-            .eq("transaction_type", "credit")
-            .eq("status", "completed");
-
-          const totalCredited = creditedData
-            ? creditedData.reduce((sum, tx) => sum + parseFloat(tx.amount), 0)
-            : 0;
-
-          // Get order count
-          const { count: ordersCount } = await supabase
-            .from("orders")
-            .select("*", { count: "exact", head: true })
-            .eq("user_id", user.id);
-
-          // Get latest ledger entry
-          const { data: latestLedger } = await supabase
-            .from("account_ledger")
-            .select("ledger_balance, status, created_at")
-            .eq("user_id", user.id)
-            .order("created_at", { ascending: false })
-            .limit(1);
-
-          return {
-            ...user,
-            balance: parseFloat(user.balance),
-            total_spent: totalSpent,
-            total_credited: totalCredited,
-            total_orders: ordersCount || 0,
-            ledger:
-              latestLedger && latestLedger.length > 0
-                ? {
-                    ledger_balance: parseFloat(latestLedger[0].ledger_balance),
-                    status: latestLedger[0].status,
-                    updated_at: latestLedger[0].created_at,
-                  }
-                : null,
-          };
-        }),
-      );
-
-      // Get total count
-      let countQuery = supabase
-        .from("users")
-        .select("*", { count: "exact", head: true });
-
-      if (search) {
-        countQuery = countQuery.or(
-          `name.ilike.%${search}%,email.ilike.%${search}%,account_number.ilike.%${search}%`,
-        );
-      }
-
-      if (status) {
-        countQuery = countQuery.eq("account_status", status);
-      }
-
-      const { count, error: countError } = await countQuery;
-
-      if (countError) {
-        console.error("Count error:", countError);
-      }
-
-      // Get summary statistics
-      const { data: summaryData } = await supabase
-        .from("users")
-        .select("balance, account_status");
-
-      let summary = {
-        total_users: count || 0,
-        total_balance: 0,
-        active_users: 0,
-        suspended_users: 0,
-      };
-
-      if (summaryData) {
-        summaryData.forEach((user) => {
-          summary.total_balance += parseFloat(user.balance || 0);
-          if (user.account_status === "active") {
-            summary.active_users += 1;
-          } else if (user.account_status === "suspended") {
-            summary.suspended_users += 1;
-          }
-        });
-      }
-
-      res.json({
-        success: true,
-        users: usersWithStats,
-        total: count || 0,
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-        summary: summary,
-      });
-    } catch (error) {
-      console.error("Get users balances error:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to fetch users",
-        error: error.message,
-      });
-    }
-  },
-);
-
-// Get account ledger discrepancies (admin)
-/*app.get(
-  "/api/admin/ledger/discrepancies",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { data: discrepancies, error } = await supabase
-        .from("account_ledger")
-        .select(
-          `
-                *,
-                user:users(id, name, email, account_number, balance)
-            `,
-        )
-        .eq("status", "flagged")
-        .order("created_at", { ascending: false });
-
-      if (error) throw error;
-
-      res.json({
-        success: true,
-        discrepancies: discrepancies || [],
-      });
-    } catch (error) {
-      console.error("Get discrepancies error:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to fetch discrepancies",
-      });
-    }
-  },
-);*/
 
 // server.js - Add GET /api/admin/ledger
 
@@ -4782,131 +4326,6 @@ app.get(
   },
 );
 
-// server.js - Add this endpoint
-
-// Get single ledger entry with line items (admin only)
-app.get(
-  "/api/admin/ledger/entry/:id",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-
-      // Get the entry from ledger_entries table
-      const { data: entry, error: entryError } = await supabase
-        .from("ledger_entries")
-        .select(
-          `
-          *,
-          created_by_user:users!ledger_entries_created_by_fkey(
-            id, 
-            name, 
-            email
-          ),
-          posted_by_user:users!ledger_entries_posted_by_fkey(
-            id, 
-            name, 
-            email
-          )
-        `,
-        )
-        .eq("id", id)
-        .single();
-
-      if (entryError || !entry) {
-        console.error("Entry fetch error:", entryError);
-        return res.status(404).json({
-          success: false,
-          message: "Ledger entry not found",
-        });
-      }
-
-      // Get line items for this entry
-      const { data: lineItems, error: lineError } = await supabase
-        .from("ledger_line_items")
-        .select(
-          `
-          *,
-          account:ledger_accounts(
-            id,
-            account_code,
-            account_name,
-            account_type
-          ),
-          user:users!ledger_line_items_user_id_fkey(
-            id,
-            name,
-            email,
-            account_number
-          )
-        `,
-        )
-        .eq("entry_id", id)
-        .order("created_at", { ascending: true });
-
-      if (lineError) {
-        console.error("Line items fetch error:", lineError);
-        // Don't fail the whole request, just return empty line items
-      }
-
-      // Format the response
-      const formattedEntry = {
-        id: entry.id,
-        entry_number: entry.entry_number,
-        transaction_date: entry.transaction_date,
-        description: entry.description,
-        reference_type: entry.reference_type,
-        reference_id: entry.reference_id,
-        created_at: entry.created_at,
-        created_by: entry.created_by,
-        created_by_name: entry.created_by_user?.name,
-        posted_at: entry.posted_at,
-        posted_by: entry.posted_by,
-        posted_by_name: entry.posted_by_user?.name,
-        is_posted: entry.is_posted,
-        notes: entry.notes,
-        line_items: (lineItems || []).map((item) => ({
-          id: item.id,
-          account_id: item.account_id,
-          account_code: item.account?.account_code,
-          account_name: item.account?.account_name,
-          account_type: item.account?.account_type,
-          user_id: item.user_id,
-          user: item.user
-            ? {
-                id: item.user.id,
-                name: item.user.name,
-                email: item.user.email,
-                account_number: item.user.account_number,
-              }
-            : null,
-          debit_amount: parseFloat(item.debit_amount || 0),
-          credit_amount: parseFloat(item.credit_amount || 0),
-          balance_before: parseFloat(item.balance_before || 0),
-          balance_after: parseFloat(item.balance_after || 0),
-          description: item.description,
-          created_at: item.created_at,
-        })),
-      };
-
-      res.json({
-        success: true,
-        entry: formattedEntry,
-      });
-    } catch (error) {
-      console.error("Get ledger entry error:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to fetch ledger entry",
-        error: error.message,
-      });
-    }
-  },
-);
-
-// server.js - Add GET /api/admin/ledger/balance/:userId
-
 // Get account balance for a specific user (admin only)
 app.get(
   "/api/admin/ledger/balance/:userId",
@@ -5199,838 +4618,6 @@ app.get(
   },
 );
 
-// server.js - Fixed GET /api/admin/ledger/discrepancies
-
-// Get account ledger discrepancies (admin)
-// server.js - Replace the entire /api/admin/ledger/discrepancies endpoint with this
-
-// Get ledger discrepancies (admin only)
-app.get(
-  "/api/admin/ledger/discrepancies",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { status } = req.query;
-
-      // Build the query using the new ledger_reconciliation table
-      let query = supabase
-        .from("ledger_reconciliation")
-        .select(
-          `
-          *,
-          user:users!ledger_reconciliation_user_id_fkey(
-            id, 
-            name, 
-            email, 
-            account_number, 
-            balance
-          ),
-          resolved_by_user:users!ledger_reconciliation_resolved_by_fkey(
-            id, 
-            name, 
-            email
-          )
-        `,
-        )
-        .order("created_at", { ascending: false });
-
-      // Apply status filter
-      if (status && status !== "all") {
-        query = query.eq("status", status);
-      }
-
-      const { data: discrepancies, error } = await query;
-
-      if (error) {
-        console.error("Ledger discrepancies error:", error);
-        return res.status(500).json({
-          success: false,
-          message: "Failed to fetch ledger discrepancies",
-          error: error.message,
-        });
-      }
-
-      // Format the response
-      const formattedDiscrepancies = (discrepancies || []).map((entry) => ({
-        id: entry.id,
-        user_id: entry.user_id,
-        user: entry.user
-          ? {
-              id: entry.user.id,
-              name: entry.user.name,
-              email: entry.user.email,
-              account_number: entry.user.account_number,
-              balance: parseFloat(entry.user.balance),
-            }
-          : null,
-        ledger_balance: parseFloat(entry.ledger_balance),
-        actual_balance: parseFloat(entry.actual_balance),
-        difference: parseFloat(entry.difference),
-        status: entry.status,
-        flagged_reason: entry.flagged_reason,
-        resolved_at: entry.resolved_at,
-        resolved_by: entry.resolved_by_user
-          ? {
-              id: entry.resolved_by_user.id,
-              name: entry.resolved_by_user.name,
-              email: entry.resolved_by_user.email,
-            }
-          : null,
-        resolution_notes: entry.resolution_notes,
-        created_at: entry.created_at,
-        updated_at: entry.updated_at,
-      }));
-
-      res.json({
-        success: true,
-        discrepancies: formattedDiscrepancies,
-        total: formattedDiscrepancies.length,
-      });
-    } catch (error) {
-      console.error("Ledger discrepancies error:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to fetch ledger discrepancies",
-        error: error.message,
-      });
-    }
-  },
-);
-
-// Merge user balance with ledger (admin)
-/*app.patch(
-  "/api/admin/ledger/:id/merge",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-
-      const { data: ledger, error: ledgerError } = await supabase
-        .from("account_ledger")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (ledgerError || !ledger) {
-        return res.status(404).json({
-          success: false,
-          message: "Ledger entry not found",
-        });
-      }
-
-      // Update user balance to match ledger
-      const { error: updateError } = await supabase
-        .from("users")
-        .update({
-          balance: ledger.ledger_balance,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", ledger.user_id);
-
-      if (updateError) throw updateError;
-
-      // Update ledger status
-      const { data: updatedLedger, error: statusError } = await supabase
-        .from("account_ledger")
-        .update({
-          status: "resolved",
-          resolved_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", id)
-        .select()
-        .single();
-
-      if (statusError) throw statusError;
-
-      // Create a new ledger entry with matched balance
-      await updateAccountLedger(ledger.user_id);
-
-      // Create notification
-      await supabase.from("payment_notifications").insert([
-        {
-          user_id: ledger.user_id,
-          type: "adjustment",
-          title: "Balance Adjustment",
-          message: `Your wallet balance has been adjusted to match the ledger balance of ₦${parseFloat(ledger.ledger_balance).toFixed(2)}.`,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-
-      res.json({
-        success: true,
-        message: "Balance merged with ledger",
-        ledger: updatedLedger,
-      });
-    } catch (error) {
-      console.error("Merge ledger error:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to merge balance",
-      });
-    }
-  },
-);
-
-// server.js - Updated merge ledger
-
-app.patch(
-  "/api/admin/ledger/:id/merge",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { notes } = req.body;
-
-      // Get reconciliation entry
-      const { data: reconciliation, error: recError } = await supabase
-        .from("ledger_reconciliation")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (recError || !reconciliation) {
-        return res.status(404).json({
-          success: false,
-          message: "Reconciliation entry not found",
-        });
-      }
-
-      if (reconciliation.status === "resolved") {
-        return res.status(400).json({
-          success: false,
-          message: "This entry has already been resolved",
-        });
-      }
-
-      // Update user balance to match ledger
-      const { error: updateError } = await supabase
-        .from("users")
-        .update({
-          balance: reconciliation.ledger_balance,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", reconciliation.user_id);
-
-      if (updateError) throw updateError;
-
-      // Create adjustment transaction
-      const adjustmentAmount =
-        reconciliation.actual_balance - reconciliation.ledger_balance;
-      const reference = generateReference();
-
-      if (Math.abs(adjustmentAmount) > 0.01) {
-        // Create ledger entry for the adjustment
-        await createLedgerEntry({
-          description: `Balance adjustment - merging with ledger`,
-          referenceType: "adjustment",
-          referenceId: id,
-          createdBy: req.userId,
-          entries: [
-            {
-              accountCode: "2000", // User Wallet
-              userId: reconciliation.user_id,
-              debit: adjustmentAmount > 0 ? Math.abs(adjustmentAmount) : 0,
-              credit: adjustmentAmount < 0 ? Math.abs(adjustmentAmount) : 0,
-              description: `Balance adjustment - merged with ledger`,
-            },
-            {
-              accountCode: "3000", // User Equity
-              userId: reconciliation.user_id,
-              debit: adjustmentAmount < 0 ? Math.abs(adjustmentAmount) : 0,
-              credit: adjustmentAmount > 0 ? Math.abs(adjustmentAmount) : 0,
-              description: `Balance adjustment - merged with ledger`,
-            },
-          ],
-        });
-
-        // Create wallet transaction
-        await supabase.from("wallet_transactions").insert([
-          {
-            user_id: reconciliation.user_id,
-            transaction_type: "adjustment",
-            amount: Math.abs(adjustmentAmount),
-            balance_before: reconciliation.actual_balance,
-            balance_after: reconciliation.ledger_balance,
-            reference: reference,
-            description: `Balance adjustment - merged with ledger (${adjustmentAmount > 0 ? "credit" : "debit"})`,
-            category: "adjustment",
-            status: "completed",
-            created_at: new Date().toISOString(),
-            completed_at: new Date().toISOString(),
-          },
-        ]);
-      }
-
-      // Update reconciliation status
-      const { data: updated, error: statusError } = await supabase
-        .from("ledger_reconciliation")
-        .update({
-          status: "merged",
-          resolved_at: new Date().toISOString(),
-          resolved_by: req.userId,
-          resolution_notes: notes || `Merged with ledger balance`,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", id)
-        .select()
-        .single();
-
-      if (statusError) throw statusError;
-
-      // Create notification
-      await supabase.from("payment_notifications").insert([
-        {
-          user_id: reconciliation.user_id,
-          type: "adjustment",
-          title: "Balance Adjustment",
-          message: `Your wallet balance has been adjusted to match the ledger. New balance: ₦${reconciliation.ledger_balance.toFixed(2)}`,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-
-      res.json({
-        success: true,
-        message: "Balance merged with ledger",
-        reconciliation: updated,
-      });
-    } catch (error) {
-      console.error("Merge ledger error:", error);
-      res.status(500).json({
-        success: false,
-        message: error.message || "Failed to merge balance",
-      });
-    }
-  },
-);*/
-
-// Reset user balance to ledger (admin)
-/*app.patch(
-  "/api/admin/ledger/:id/reset",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-
-      const { data: ledger, error: ledgerError } = await supabase
-        .from("account_ledger")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (ledgerError || !ledger) {
-        return res.status(404).json({
-          success: false,
-          message: "Ledger entry not found",
-        });
-      }
-
-      // Reset user balance to ledger balance
-      const { error: updateError } = await supabase
-        .from("users")
-        .update({
-          balance: ledger.ledger_balance,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", ledger.user_id);
-
-      if (updateError) throw updateError;
-
-      // Create adjustment transaction
-      const reference = generateReference();
-      const { data: user, error: userError } = await supabase
-        .from("users")
-        .select("balance")
-        .eq("id", ledger.user_id)
-        .single();
-
-      if (!userError && user) {
-        await supabase.from("wallet_transactions").insert([
-          {
-            user_id: ledger.user_id,
-            transaction_type: "adjustment",
-            amount:
-              parseFloat(ledger.ledger_balance) -
-              parseFloat(ledger.actual_balance),
-            balance_before: parseFloat(ledger.actual_balance),
-            balance_after: parseFloat(user.balance),
-            reference: reference,
-            description: `Balance reset to match ledger - ${reference}`,
-            category: "adjustment",
-            status: "completed",
-            created_at: new Date().toISOString(),
-            completed_at: new Date().toISOString(),
-          },
-        ]);
-      }
-
-      // Update ledger status
-      const { data: updatedLedger, error: statusError } = await supabase
-        .from("account_ledger")
-        .update({
-          status: "resolved",
-          resolved_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", id)
-        .select()
-        .single();
-
-      if (statusError) throw statusError;
-
-      // Create new ledger entry
-      await updateAccountLedger(ledger.user_id);
-
-      // Create notification
-      await supabase.from("payment_notifications").insert([
-        {
-          user_id: ledger.user_id,
-          type: "adjustment",
-          title: "Balance Reset",
-          message: `Your wallet balance has been reset to ₦${parseFloat(ledger.ledger_balance).toFixed(2)} to match the ledger.`,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-
-      res.json({
-        success: true,
-        message: "Balance reset to ledger",
-        ledger: updatedLedger,
-      });
-    } catch (error) {
-      console.error("Reset ledger error:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to reset balance",
-      });
-    }
-  },
-);
-
-// server.js - Updated reset ledger
-
-app.patch(
-  "/api/admin/ledger/:id/reset",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { notes } = req.body;
-
-      // Get reconciliation entry
-      const { data: reconciliation, error: recError } = await supabase
-        .from("ledger_reconciliation")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (recError || !reconciliation) {
-        return res.status(404).json({
-          success: false,
-          message: "Reconciliation entry not found",
-        });
-      }
-
-      if (reconciliation.status === "resolved") {
-        return res.status(400).json({
-          success: false,
-          message: "This entry has already been resolved",
-        });
-      }
-
-      // Update reconciliation status to rejected
-      const { data: updated, error: statusError } = await supabase
-        .from("ledger_reconciliation")
-        .update({
-          status: "rejected",
-          resolved_at: new Date().toISOString(),
-          resolved_by: req.userId,
-          resolution_notes: notes || `Rejected - keeping user balance`,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", id)
-        .select()
-        .single();
-
-      if (statusError) throw statusError;
-
-      // Create notification
-      await supabase.from("payment_notifications").insert([
-        {
-          user_id: reconciliation.user_id,
-          type: "adjustment",
-          title: "Balance Adjustment Rejected",
-          message: `The balance adjustment request has been rejected. Your balance remains ₦${reconciliation.actual_balance.toFixed(2)}`,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-
-      res.json({
-        success: true,
-        message: "Balance adjustment rejected",
-        reconciliation: updated,
-      });
-    } catch (error) {
-      console.error("Reset ledger error:", error);
-      res.status(500).json({
-        success: false,
-        message: error.message || "Failed to reject adjustment",
-      });
-    }
-  },
-);*/
-
-// server.js - Replace the merge and reset endpoints with these
-
-// Merge: Accept user's actual balance as source of truth
-app.patch(
-  "/api/admin/ledger/:id/merge",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { notes } = req.body;
-
-      // Get reconciliation entry
-      const { data: reconciliation, error: recError } = await supabase
-        .from("ledger_reconciliation")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (recError || !reconciliation) {
-        return res.status(404).json({
-          success: false,
-          message: "Reconciliation entry not found",
-        });
-      }
-
-      if (reconciliation.status === "merged" || reconciliation.status === "resolved") {
-        return res.status(400).json({
-          success: false,
-          message: "This entry has already been resolved",
-        });
-      }
-
-      // Get user's current balance
-      const { data: user, error: userError } = await supabase
-        .from("users")
-        .select("balance")
-        .eq("id", reconciliation.user_id)
-        .single();
-
-      if (userError || !user) {
-        return res.status(404).json({
-          success: false,
-          message: "User not found",
-        });
-      }
-
-      const userBalance = parseFloat(user.balance);
-      const ledgerBalance = parseFloat(reconciliation.ledger_balance);
-
-      // STEP 1: Update ledger balance to match user's actual balance
-      // Get the user wallet account ID (account_code '2000')
-      const { data: walletAccount, error: accountError } = await supabase
-        .from("ledger_accounts")
-        .select("id")
-        .eq("account_code", "2000")
-        .single();
-
-      if (accountError || !walletAccount) {
-        return res.status(500).json({
-          success: false,
-          message: "Wallet account not found",
-        });
-      }
-
-      // Update account_balances to match user balance
-      const { error: balanceUpdateError } = await supabase
-        .from("account_balances")
-        .update({
-          balance: userBalance,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("account_id", walletAccount.id)
-        .eq("user_id", reconciliation.user_id);
-
-      if (balanceUpdateError) {
-        console.error("Balance update error:", balanceUpdateError);
-        // If no record exists, insert one
-        const { error: insertError } = await supabase
-          .from("account_balances")
-          .insert([
-            {
-              account_id: walletAccount.id,
-              user_id: reconciliation.user_id,
-              balance: userBalance,
-              updated_at: new Date().toISOString(),
-            },
-          ]);
-
-        if (insertError) {
-          return res.status(500).json({
-            success: false,
-            message: "Failed to update ledger balance",
-          });
-        }
-      }
-
-      // STEP 2: Create a ledger entry for the adjustment (merge)
-      const reference = generateReference();
-      
-      // Create ledger entry with double-entry
-      await createLedgerEntry({
-        description: `Balance adjustment - merged with user balance (${reference})`,
-        referenceType: "adjustment",
-        referenceId: id,
-        createdBy: req.userId,
-        entries: [
-          {
-            // Debit/credit to adjust ledger to match user balance
-            accountCode: "2000", // User Wallet
-            userId: reconciliation.user_id,
-            debit: userBalance > ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
-            credit: userBalance < ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
-            description: `Merge: User balance accepted as source of truth (${reference})`,
-          },
-          {
-            // Contra account for the adjustment
-            accountCode: "3000", // User Equity
-            userId: reconciliation.user_id,
-            debit: userBalance < ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
-            credit: userBalance > ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
-            description: `Merge: User balance accepted as source of truth (${reference})`,
-          },
-        ],
-      });
-
-      // STEP 3: Create a wallet transaction record for the adjustment
-      const transactionId = uuidv4();
-      const { error: txError } = await supabase
-        .from("wallet_transactions")
-        .insert([
-          {
-            id: transactionId,
-            user_id: reconciliation.user_id,
-            transaction_type: "adjustment",
-            amount: Math.abs(userBalance - ledgerBalance),
-            balance_before: ledgerBalance,
-            balance_after: userBalance,
-            reference: reference,
-            description: `Balance adjustment - merged with user balance`,
-            category: "adjustment",
-            status: "completed",
-            created_at: new Date().toISOString(),
-            completed_at: new Date().toISOString(),
-          },
-        ]);
-
-      if (txError) {
-        console.error("Transaction creation error:", txError);
-        // Non-critical, continue
-      }
-
-      // STEP 4: Update reconciliation status
-      const { data: updated, error: statusError } = await supabase
-        .from("ledger_reconciliation")
-        .update({
-          status: "merged",
-          resolved_at: new Date().toISOString(),
-          resolved_by: req.userId,
-          resolution_notes: notes || `Merged: User balance (₦${userBalance.toFixed(2)}) accepted as source of truth`,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", id)
-        .select()
-        .single();
-
-      if (statusError) throw statusError;
-
-      // STEP 5: Create notification for user
-      await supabase.from("payment_notifications").insert([
-        {
-          user_id: reconciliation.user_id,
-          type: "adjustment",
-          title: "Balance Adjustment",
-          message: `Your wallet balance has been adjusted to match your current balance. New balance: ₦${userBalance.toFixed(2)}`,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-
-      res.json({
-        success: true,
-        message: "User balance accepted as source of truth. Ledger updated to match user balance.",
-        reconciliation: updated,
-        balance_after: userBalance,
-      });
-    } catch (error) {
-      console.error("Merge ledger error:", error);
-      res.status(500).json({
-        success: false,
-        message: error.message || "Failed to merge balance",
-      });
-    }
-  }
-);
-
-// Reject: Accept ledger balance as source of truth (reset user balance to ledger)
-app.patch(
-  "/api/admin/ledger/:id/reject",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { notes } = req.body;
-
-      // Get reconciliation entry
-      const { data: reconciliation, error: recError } = await supabase
-        .from("ledger_reconciliation")
-        .select("*")
-        .eq("id", id)
-        .single();
-
-      if (recError || !reconciliation) {
-        return res.status(404).json({
-          success: false,
-          message: "Reconciliation entry not found",
-        });
-      }
-
-      if (reconciliation.status === "merged" || reconciliation.status === "resolved") {
-        return res.status(400).json({
-          success: false,
-          message: "This entry has already been resolved",
-        });
-      }
-
-      const userBalance = parseFloat(reconciliation.actual_balance);
-      const ledgerBalance = parseFloat(reconciliation.ledger_balance);
-
-      // STEP 1: Update user balance to match ledger balance
-      const { error: updateError } = await supabase
-        .from("users")
-        .update({
-          balance: ledgerBalance,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", reconciliation.user_id);
-
-      if (updateError) {
-        return res.status(500).json({
-          success: false,
-          message: "Failed to update user balance",
-        });
-      }
-
-      // STEP 2: Create a ledger entry for the adjustment (reject)
-      const reference = generateReference();
-
-      // Create ledger entry with double-entry
-      await createLedgerEntry({
-        description: `Balance adjustment - rejected user balance, ledger accepted (${reference})`,
-        referenceType: "adjustment",
-        referenceId: id,
-        createdBy: req.userId,
-        entries: [
-          {
-            // Debit/credit to adjust user balance to match ledger
-            accountCode: "2000", // User Wallet
-            userId: reconciliation.user_id,
-            debit: userBalance > ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
-            credit: userBalance < ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
-            description: `Reject: Ledger balance accepted as source of truth (${reference})`,
-          },
-          {
-            // Contra account for the adjustment
-            accountCode: "3000", // User Equity
-            userId: reconciliation.user_id,
-            debit: userBalance < ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
-            credit: userBalance > ledgerBalance ? Math.abs(userBalance - ledgerBalance) : 0,
-            description: `Reject: Ledger balance accepted as source of truth (${reference})`,
-          },
-        ],
-      });
-
-      // STEP 3: Create a wallet transaction record for the adjustment
-      const transactionId = uuidv4();
-      const { error: txError } = await supabase
-        .from("wallet_transactions")
-        .insert([
-          {
-            id: transactionId,
-            user_id: reconciliation.user_id,
-            transaction_type: "adjustment",
-            amount: Math.abs(userBalance - ledgerBalance),
-            balance_before: userBalance,
-            balance_after: ledgerBalance,
-            reference: reference,
-            description: `Balance adjustment - rejected user balance, ledger accepted`,
-            category: "adjustment",
-            status: "completed",
-            created_at: new Date().toISOString(),
-            completed_at: new Date().toISOString(),
-          },
-        ]);
-
-      if (txError) {
-        console.error("Transaction creation error:", txError);
-        // Non-critical, continue
-      }
-
-      // STEP 4: Update reconciliation status to "resolved" (rejected)
-      const { data: updated, error: statusError } = await supabase
-        .from("ledger_reconciliation")
-        .update({
-          status: "resolved",
-          resolved_at: new Date().toISOString(),
-          resolved_by: req.userId,
-          resolution_notes: notes || `Rejected: Ledger balance (₦${ledgerBalance.toFixed(2)}) accepted as source of truth`,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", id)
-        .select()
-        .single();
-
-      if (statusError) throw statusError;
-
-      // STEP 5: Create notification for user
-      await supabase.from("payment_notifications").insert([
-        {
-          user_id: reconciliation.user_id,
-          type: "adjustment",
-          title: "Balance Adjustment",
-          message: `Your wallet balance has been adjusted to match the ledger balance. New balance: ₦${ledgerBalance.toFixed(2)}`,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-
-      res.json({
-        success: true,
-        message: "Ledger balance accepted as source of truth. User balance updated to match ledger.",
-        reconciliation: updated,
-        balance_after: ledgerBalance,
-      });
-    } catch (error) {
-      console.error("Reject ledger error:", error);
-      res.status(500).json({
-        success: false,
-        message: error.message || "Failed to reject user balance",
-      });
-    }
-  }
-);
-
-
-
-// server.js - Add this endpoint
 
 // Get ledger stats (admin only)
 app.get(
@@ -6103,73 +4690,7 @@ app.get(
   },
 );
 
-// server.js - Add this endpoint
 
-// Get single ledger entry with line items (admin only)
-app.get(
-  "/api/admin/ledger/entry/:id",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-
-      // Get the entry
-      const { data: entry, error: entryError } = await supabase
-        .from("ledger_entries")
-        .select(
-          `
-                    *,
-                    created_by_user:users!ledger_entries_created_by_fkey(id, name, email),
-                    posted_by_user:users!ledger_entries_posted_by_fkey(id, name, email)
-                `,
-        )
-        .eq("id", id)
-        .single();
-
-      if (entryError || !entry) {
-        return res.status(404).json({
-          success: false,
-          message: "Ledger entry not found",
-        });
-      }
-
-      // Get line items
-      const { data: lineItems, error: lineError } = await supabase
-        .from("ledger_line_items")
-        .select(
-          `
-                    *,
-                    account:ledger_accounts(account_code, account_name, account_type),
-                    user:users!ledger_line_items_user_id_fkey(id, name, email, account_number)
-                `,
-        )
-        .eq("entry_id", id)
-        .order("created_at", { ascending: true });
-
-      if (lineError) {
-        console.error("Line items error:", lineError);
-      }
-
-      res.json({
-        success: true,
-        entry: {
-          ...entry,
-          created_by_name: entry.created_by_user?.name,
-          posted_by_name: entry.posted_by_user?.name,
-          line_items: lineItems || [],
-        },
-      });
-    } catch (error) {
-      console.error("Get ledger entry error:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to fetch ledger entry",
-        error: error.message,
-      });
-    }
-  },
-);
 
 // Get all notifications (user)
 app.get("/api/notifications", authMiddleware, async (req, res) => {
