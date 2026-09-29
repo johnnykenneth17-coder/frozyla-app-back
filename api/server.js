@@ -9,6 +9,7 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const { createClient } = require("@supabase/supabase-js");
 const { v4: uuidv4 } = require("uuid");
+const bcrypt = require('bcrypt');
 
 // IMPORTANT: Fix the path to auth.js - it's now in ../middleware/auth.js
 const {
