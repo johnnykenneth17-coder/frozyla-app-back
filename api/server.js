@@ -227,8 +227,8 @@ app.use("/api/push", authMiddleware, pushRouter);
     const glReconciliationCronRouter = require("../lib/gl-reconciliation-cron-routes");
   app.use("/api/cron/gl-reconciliation", glReconciliationCronRouter);
 
-     const riderMiddleware = require("./lib/rider-middleware");
-   const riderRouter = require("./lib/rider-routes");
+     const riderMiddleware = require("../middleware/rider-middleware");
+   const riderRouter = require("../lib/rider-routes");
    app.use("/api/rider", authMiddleware, riderMiddleware, riderRouter);
 
 app.patch(
@@ -2615,7 +2615,7 @@ app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
 // so a live discrepancy surfaces the moment a real user hits it
 // instead of waiting for the next scheduled sweep.
 async function compareWalletBalanceToLedger(userId, usersBalanceValue) {
-  const ledgerService = require("./lib/ledger-service");
+  const ledgerService = require("../lib/ledger-service");
   const glBalance = await ledgerService.getAccountBalance({ accountCode: "2000", ownerId: userId });
   const difference = Math.round((Number(usersBalanceValue) - Number(glBalance.ledger_balance)) * 100) / 100;
 
