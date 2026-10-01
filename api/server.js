@@ -49,6 +49,11 @@ const allowedOrigins = [
   "http://localhost:5500",
   "http://localhost:5501",
   "http://localhost:5502",
+  // Capacitor native webview origins (Android / iOS)
+  "http://localhost",
+  "https://localhost",
+  "capacitor://localhost",
+  "ionic://localhost",
   "https://frozyla-app.vercel.app",
   "https://frozyla.vercel.app",
   "https://frozyla-app-back.vercel.app",
@@ -75,7 +80,12 @@ app.use(
       }
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "Idempotency-Key",
+    ],
     credentials: true,
     maxAge: 86400, // 24 hours
   }),
