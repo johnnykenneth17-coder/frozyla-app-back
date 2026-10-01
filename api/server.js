@@ -1286,6 +1286,44 @@ app.patch("/api/orders/:id/delivery", authMiddleware, async (req, res) => {
   },
 );*/
 
+// Admin lifecycle helper. The state machine deliberately separates
+// CONFIRMED (order accepted) from PREPARING, but the admin UI only has
+// a "Preparing" action. If the order is still PAID, record the implicit
+// confirmation as its own audited transition first, then do the
+// requested one. Every hop still goes through transition_order_status(),
+// so the state machine remains the single authority on what is legal;
+// skipping further steps (e.g. PAID -> READY_FOR_DELIVERY) is still rejected.
+async function adminTransitionOrder(orderId, newStatus, adminId, reason) {
+  if (newStatus === "PREPARING") {
+    const { data: current } = await supabase
+      .from("orders")
+      .select("status")
+      .eq("id", orderId)
+      .maybeSingle();
+    if (current && current.status === "PAID") {
+      const { data: confirmResult, error: confirmErr } = await supabase.rpc(
+        "transition_order_status",
+        {
+          p_order_id: orderId,
+          p_new_status: "CONFIRMED",
+          p_actor_type: "admin",
+          p_actor_id: adminId,
+          p_reason: "Auto-confirmed when preparation started",
+        },
+      );
+      if (confirmErr) return { data: null, error: confirmErr };
+      if (!confirmResult.success) return { data: confirmResult, error: null };
+    }
+  }
+  return supabase.rpc("transition_order_status", {
+    p_order_id: orderId,
+    p_new_status: newStatus,
+    p_actor_type: "admin",
+    p_actor_id: adminId,
+    p_reason: reason || null,
+  });
+}
+
 app.patch(
   "/api/admin/orders/:id/delivery-status",
   authMiddleware,
@@ -1310,13 +1348,7 @@ app.patch(
         return res.status(400).json({ success: false, message: "Invalid delivery status" });
       }
 
-      const { data: result, error } = await supabase.rpc("transition_order_status", {
-        p_order_id: id,
-        p_new_status: newStatus,
-        p_actor_type: "admin",
-        p_actor_id: req.userId,
-        p_reason: reason || null,
-      });
+      const { data: result, error } = await adminTransitionOrder(id, newStatus, req.userId, reason);
 
       if (error) {
         console.error("transition_order_status RPC error:", error);
@@ -2511,8 +2543,22 @@ app.get("/api/orders/:id", authMiddleware, async (req, res) => {
 app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, reason } = req.body;
+    let { status, reason } = req.body;
     const isAdmin = req.userRole === "admin";
+
+    // The admin order table still sends the pre-state-machine lowercase
+    // vocabulary ('preparing', 'ready', 'delivered'). Translate it for
+    // admins so those buttons keep working. 'cancelled' is intentionally
+    // NOT mapped: cancellation is now a refund flow (CANCELLATION_PENDING
+    // -> approve-cancellation), not a one-click status.
+    if (isAdmin && typeof status === "string") {
+      const LEGACY_ADMIN_STATUS = {
+        preparing: "PREPARING",
+        ready: "READY_FOR_DELIVERY",
+        delivered: "DELIVERED",
+      };
+      status = LEGACY_ADMIN_STATUS[status] || status;
+    }
 
     // Customers may only ever request cancellation. Admins/staff get
     // the full lifecycle via the admin route below, not this one.
@@ -2533,13 +2579,15 @@ app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
       }
     }
 
-    const { data: result, error } = await supabase.rpc("transition_order_status", {
-      p_order_id: id,
-      p_new_status: status,
-      p_actor_type: isAdmin ? "admin" : "customer",
-      p_actor_id: req.userId,
-      p_reason: reason || null,
-    });
+    const { data: result, error } = isAdmin
+      ? await adminTransitionOrder(id, status, req.userId, reason)
+      : await supabase.rpc("transition_order_status", {
+          p_order_id: id,
+          p_new_status: status,
+          p_actor_type: "customer",
+          p_actor_id: req.userId,
+          p_reason: reason || null,
+        });
 
     if (error) {
       console.error("transition_order_status RPC error:", error);
