@@ -2463,6 +2463,54 @@ app.get("/api/orders", authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/orders/:id/delivery-pin
+//
+// The delivery PIN lives in delivery_verification and is deliberately
+// NOT part of GET /api/orders (admins receive every order from that
+// route, and the list is polled every few seconds). This endpoint is
+// the only place a PIN leaves the database, and it is strict:
+//   - OWNER ONLY: user_id must equal the caller. There is no admin
+//     bypass, unlike the order routes above.
+//   - STATUS GATED: the PIN is released only while the order is
+//     OUT_FOR_DELIVERY. Before that it is "not available yet"; after
+//     DELIVERED it is no longer needed and is not returned again.
+app.get("/api/orders/:id/delivery-pin", authMiddleware, async (req, res) => {
+  try {
+    const { data: order, error: orderErr } = await supabase
+      .from("orders")
+      .select("id, status, delivery_address")
+      .eq("id", req.params.id)
+      .eq("user_id", req.userId)
+      .maybeSingle();
+    if (orderErr) throw orderErr;
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const base = { success: true, order_id: order.id, status: order.status };
+
+    if (order.status !== "OUT_FOR_DELIVERY") {
+      return res.json({ ...base, pin_available: false });
+    }
+
+    const { data: verification, error: pinErr } = await supabase
+      .from("delivery_verification")
+      .select("delivery_pin, pin_verified_at")
+      .eq("order_id", order.id)
+      .maybeSingle();
+    if (pinErr) throw pinErr;
+
+    if (!verification || verification.pin_verified_at) {
+      return res.json({ ...base, pin_available: false });
+    }
+
+    res.json({ ...base, pin_available: true, delivery_pin: verification.delivery_pin });
+  } catch (error) {
+    console.error("Delivery PIN fetch error:", error);
+    res.status(500).json({ success: false, message: "Failed to load delivery code" });
+  }
+});
+
 app.get("/api/orders/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2550,9 +2598,7 @@ app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
 
     // The admin order table still sends the pre-state-machine lowercase
     // vocabulary ('preparing', 'ready', 'delivered'). Translate it for
-    // admins so those buttons keep working. 'cancelled' is intentionally
-    // NOT mapped: cancellation is now a refund flow (CANCELLATION_PENDING
-    // -> approve-cancellation), not a one-click status.
+    // admins so those buttons keep working.
     if (isAdmin && typeof status === "string") {
       const LEGACY_ADMIN_STATUS = {
         preparing: "PREPARING",
@@ -2560,6 +2606,32 @@ app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
         delivered: "DELIVERED",
       };
       status = LEGACY_ADMIN_STATUS[status] || status;
+    }
+
+    // CANCELLATION. Both apps still send the legacy 'cancelled' value
+    // (the customer app also may send CANCELLATION_PENDING); all three
+    // mean "cancel this order". Business rule: an order can be cancelled
+    // ONLY while it is still PAID — once the kitchen has started, the
+    // customer is liable. cancel_paid_order() enforces that rule under a
+    // row lock and does cancel + refund in ONE transaction, so there is
+    // no half-cancelled state and no race with an admin pressing
+    // "Preparing" at the same moment.
+    if (["cancelled", "CANCELLED", "CANCELLATION_PENDING"].includes(status)) {
+      const { data: cancelResult, error: cancelErr } = await supabase.rpc("cancel_paid_order", {
+        p_order_id: id,
+        p_actor_type: isAdmin ? "admin" : "customer",
+        p_actor_id: req.userId,
+        p_reason: reason || null,
+      });
+      if (cancelErr) {
+        console.error("cancel_paid_order RPC error:", cancelErr);
+        return res.status(500).json({ success: false, message: "Failed to cancel order" });
+      }
+      if (!cancelResult.success) {
+        const httpByCode = { ORDER_NOT_FOUND: 404, NOT_CANCELLABLE: 409 };
+        return res.status(httpByCode[cancelResult.code] || 400).json(cancelResult);
+      }
+      return res.json({ success: true, message: "Order cancelled and refunded", ...cancelResult });
     }
 
     // Customers may only ever request cancellation. Admins/staff get
