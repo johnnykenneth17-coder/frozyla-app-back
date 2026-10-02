@@ -2142,7 +2142,9 @@ app.post(
         });
       }
 
-      const itemId = `item_${Date.now()}`;
+      // menu_items.id is a uuid column in production — the old
+      // `item_<timestamp>` ids were rejected with Postgres 22P02.
+      const itemId = uuidv4();
       const { data, error } = await supabase
         .from("menu_items")
         .insert([
