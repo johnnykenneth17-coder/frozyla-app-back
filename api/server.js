@@ -9,13 +9,17 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const { createClient } = require("@supabase/supabase-js");
 const { v4: uuidv4 } = require("uuid");
-const bcrypt = require('bcrypt');
+const bcrypt = require("bcrypt");
 
 // IMPORTANT: Fix the path to auth.js - it's now in ../middleware/auth.js
 const {
   authMiddleware,
   adminMiddleware,
   staffMiddleware,
+  requireActiveAccount,
+  requireLegalAcceptance,
+  forgotPassword,
+  resetPassword,
   signupUser,
   loginUser,
   loginWithPasscode,
@@ -30,8 +34,17 @@ const analyticsRoutes = require("../lib/analytics-routes");
 const opsRoutes = require("../lib/ops-routes");
 
 const feecentPaymentsClient = require("../lib/feecent-payments-client");
+const savedCards = require("../lib/saved-cards-service");
 
 const app = express();
+
+// ===== ERROR-DETAIL HELPERS (F-17) =====
+// Internal error text (SQL/driver messages) must not reach clients in
+// production. In development the detail is kept because it is useful.
+const IS_PROD = process.env.NODE_ENV === "production";
+const publicError = (error) => (IS_PROD ? undefined : error && error.message);
+const publicErrorMessage = (error, fallback) =>
+  IS_PROD ? fallback : (error && error.message) || fallback;
 const PORT = process.env.PORT || 5000;
 
 app.set("trust proxy", 1);
@@ -57,42 +70,40 @@ const allowedOrigins = [
   "https://frozyla-app.vercel.app",
   "https://frozyla.vercel.app",
   "https://frozyla-app-back.vercel.app",
-  // Add your production frontend URL here
-  "https://your-frontend-domain.vercel.app",
 ];
 
 // Enable CORS with proper configuration
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      // Allow requests with no origin (like mobile apps or curl requests)
-      if (!origin) return callback(null, true);
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
 
-      // Allow if origin is in the allowed list or in development
-      if (
-        allowedOrigins.indexOf(origin) !== -1 ||
-        process.env.NODE_ENV === "development"
-      ) {
-        callback(null, true);
-      } else {
-        console.log(`CORS blocked origin: ${origin}`);
-        callback(new Error(`Origin ${origin} not allowed by CORS`));
-      }
-    },
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "X-Requested-With",
-      "Idempotency-Key",
-    ],
-    credentials: true,
-    maxAge: 86400, // 24 hours
-  }),
-);
+    // Allow if origin is in the allowed list or in development
+    if (
+      allowedOrigins.indexOf(origin) !== -1 ||
+      process.env.NODE_ENV === "development"
+    ) {
+      callback(null, true);
+    } else {
+      console.log(`CORS blocked origin: ${origin}`);
+      callback(new Error(`Origin ${origin} not allowed by CORS`));
+    }
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Requested-With",
+    "Idempotency-Key",
+  ],
+  credentials: true,
+  maxAge: 86400, // 24 hours
+};
+app.use(cors(corsOptions));
 
-// Handle preflight requests
-app.options("*", cors());
+// Handle preflight with the SAME policy. (A bare cors() here answered every
+// preflight for every origin, regardless of the allow-list above.)
+app.options("*", cors(corsOptions));
 
 // ===== RATE LIMITING =====
 /*const limiter = rateLimit({
@@ -132,6 +143,48 @@ const authLimiter = rateLimit({
 });
 app.use("/api/auth", authLimiter);
 
+// Credential-guessing endpoints get a much tighter per-IP budget. The
+// per-ACCOUNT lockout (users.locked_until) is the primary control; this limiter
+// only slows one source. NOTE: express-rate-limit's default store is in-memory,
+// i.e. per serverless instance, so it is a speed bump, not a guarantee.
+const credentialLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many attempts. Please try again in a minute.",
+  },
+});
+app.use(["/api/auth/login", "/api/auth/login-passcode"], credentialLimiter);
+
+// Password recovery: sending email costs money and can be abused to spam a victim, so it gets its own
+// small budget (per IP here; per ACCOUNT in create_password_reset: max 3 per rolling hour).
+const forgotLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: true,
+    message:
+      "If an account exists for that email, we've sent password reset instructions.",
+  },
+});
+const resetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many attempts. Please try again later.",
+  },
+});
+app.use("/api/auth/forgot-password", forgotLimiter);
+app.use("/api/auth/reset-password", resetLimiter);
+
 // ✅ NEW: Very lenient limiter for admin users
 const adminLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -145,16 +198,19 @@ const adminLimiter = rateLimit({
 });
 
 const frozylaCronRouter = require("../lib/frozyla-cron-routes");
-   app.use("/api/cron", frozylaCronRouter);
+app.use("/api/cron", frozylaCronRouter);
 
-const { rawBodyJson, verifyFeecentSignature } = require("../lib/frozyla-feecent-auth-middleware");
-   const frozylaIntegrationRouter = require("../lib/frozyla-integration-routes");
-   app.use(
-     "/api/v1/integrations/feecent/frozyla",
-     rawBodyJson,
-     verifyFeecentSignature,
-     frozylaIntegrationRouter,
-   );
+const {
+  rawBodyJson,
+  verifyFeecentSignature,
+} = require("../lib/frozyla-feecent-auth-middleware");
+const frozylaIntegrationRouter = require("../lib/frozyla-integration-routes");
+app.use(
+  "/api/v1/integrations/feecent/frozyla",
+  rawBodyJson,
+  verifyFeecentSignature,
+  frozylaIntegrationRouter,
+);
 
 // Admin routes - more lenient
 app.use("/api/admin", (req, res, next) => {
@@ -171,7 +227,7 @@ app.use("/api/admin/ops", opsRoutes);
 // ===== SUPABASE INIT =====
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY,
+  process.env.SUPABASE_SERVICE_KEY,
 );
 
 // ===== HEALTH CHECK =====
@@ -186,6 +242,8 @@ app.get("/api/health", (req, res) => {
 
 // ===== CORS TEST ENDPOINT =====
 app.get("/api/cors-test", (req, res) => {
+  if (IS_PROD)
+    return res.status(404).json({ success: false, message: "Not found" });
   res.json({
     success: true,
     message: "CORS is working!",
@@ -202,6 +260,8 @@ app.post("/api/auth/google", googleAuth);
 app.get("/api/auth/profile", authMiddleware, getProfile);
 app.post("/api/auth/change-password", authMiddleware, changePassword);
 app.post("/api/auth/refresh", authMiddleware, refreshToken);
+app.post("/api/auth/forgot-password", forgotPassword);
+app.post("/api/auth/reset-password", resetPassword);
 
 // ===== ADMIN ROUTES =====
 app.get(
@@ -229,18 +289,50 @@ app.get(
 const pushRouter = require("../lib/push-routes");
 app.use("/api/push", authMiddleware, pushRouter);
 
-   const glAdminRouter = require("../lib/gl-admin-routes");
-   app.use("/api/admin/gl", authMiddleware, adminMiddleware, glAdminRouter);
+const glAdminRouter = require("../lib/gl-admin-routes");
+app.use("/api/admin/gl", authMiddleware, adminMiddleware, glAdminRouter);
 
-      const adminRiderRouter = require("../lib/admin-rider-routes");
-  app.use("/api/admin/riders", authMiddleware, adminMiddleware, adminRiderRouter);
+const adminRiderRouter = require("../lib/admin-rider-routes");
+app.use("/api/admin/riders", authMiddleware, adminMiddleware, adminRiderRouter);
 
-    const glReconciliationCronRouter = require("../lib/gl-reconciliation-cron-routes");
-  app.use("/api/cron/gl-reconciliation", glReconciliationCronRouter);
+// Delivery pricing, rider earnings, legal (migrations 003-006)
+const deliveryPricing = require("../lib/delivery-pricing-routes");
+const quoteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many requests. Please slow down." },
+});
+app.use(
+  "/api/admin/delivery",
+  authMiddleware,
+  adminMiddleware,
+  deliveryPricing.adminRouter,
+);
+app.use(
+  "/api/delivery",
+  quoteLimiter,
+  authMiddleware,
+  requireActiveAccount,
+  deliveryPricing.customerRouter,
+);
+app.use(
+  "/api/admin/rider-earnings",
+  authMiddleware,
+  adminMiddleware,
+  require("../lib/rider-earnings-routes"),
+);
+const legal = require("../lib/legal-routes");
+app.use("/api/legal", legal.router);
+app.use("/api/legal", legal.acceptRouter(authMiddleware));
 
-     const riderMiddleware = require("../middleware/rider-middleware");
-   const riderRouter = require("../lib/rider-routes");
-   app.use("/api/rider", authMiddleware, riderMiddleware, riderRouter);
+const glReconciliationCronRouter = require("../lib/gl-reconciliation-cron-routes");
+app.use("/api/cron/gl-reconciliation", glReconciliationCronRouter);
+
+const riderMiddleware = require("../middleware/rider-middleware");
+const riderRouter = require("../lib/rider-routes");
+app.use("/api/rider", authMiddleware, riderMiddleware, riderRouter);
 
 app.patch(
   "/api/admin/users/:id/role",
@@ -287,6 +379,128 @@ app.patch(
   },
 );
 
+// ============================================
+// MENU DETAIL & RELATED — Phase B (read-only)
+// ============================================
+//
+// GET /api/menu/:id
+// Returns one item with its images, variant_groups (with choices), and
+// extras. Called by product-modal.js. Public — no auth required.
+app.get("/api/menu/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        id,
+      );
+    if (!isUuid)
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid item id" });
+
+    const { data: item, error } = await supabase
+      .from("menu_items")
+      .select(
+        "id, name, description, price, category, image_url, is_available, badge, stock_count",
+      )
+      .eq("id", id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!item)
+      return res
+        .status(404)
+        .json({ success: false, message: "Item not found" });
+
+    const [{ data: images }, { data: groups }, { data: extras }] =
+      await Promise.all([
+        supabase
+          .from("menu_item_images")
+          .select("url, is_primary, sort_order")
+          .eq("item_id", id)
+          .order("is_primary", { ascending: false })
+          .order("sort_order"),
+        supabase
+          .from("menu_item_variant_groups")
+          .select(
+            "id, name, sort_order, is_active, menu_item_variants(id, name, price_delta, is_available, is_default, sort_order)",
+          )
+          .eq("item_id", id)
+          .eq("is_active", true)
+          .order("sort_order"),
+        supabase
+          .from("menu_item_extras")
+          .select("id, name, price_delta, is_available, sort_order")
+          .eq("item_id", id)
+          .order("sort_order"),
+      ]);
+
+    const variant_groups = (groups || []).map((g) => ({
+      id: g.id,
+      name: g.name,
+      sort_order: g.sort_order,
+      choices: (g.menu_item_variants || []).sort(
+        (a, b) => (a.sort_order || 0) - (b.sort_order || 0),
+      ),
+    }));
+
+    res.json({
+      success: true,
+      item: {
+        ...item,
+        images: images || [],
+        variant_groups,
+        extras: extras || [],
+      },
+    });
+  } catch (error) {
+    console.error("Menu detail error:", error);
+    res.status(500).json({ success: false, message: "Failed to load item" });
+  }
+});
+
+// GET /api/menu/:id/related
+// Same-category items excluding the current one, up to `limit`. Public.
+app.get("/api/menu/:id/related", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 6, 20);
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        id,
+      );
+    if (!isUuid)
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid item id" });
+
+    const { data: item } = await supabase
+      .from("menu_items")
+      .select("category")
+      .eq("id", id)
+      .maybeSingle();
+    if (!item)
+      return res
+        .status(404)
+        .json({ success: false, message: "Item not found" });
+
+    const { data, error } = await supabase
+      .from("menu_items")
+      .select("id, name, price, image_url")
+      .eq("category", item.category)
+      .eq("is_available", true)
+      .neq("id", id)
+      .limit(limit);
+    if (error) throw error;
+
+    res.json({ success: true, items: data || [] });
+  } catch (error) {
+    console.error("Related items error:", error);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to load related items" });
+  }
+});
+
 // ===== MENU ROUTES =====
 app.get("/api/menu", async (req, res) => {
   try {
@@ -304,7 +518,7 @@ app.get("/api/menu", async (req, res) => {
       return res.status(500).json({
         success: false,
         message: "Failed to fetch menu",
-        error: error.message,
+        error: publicError(error),
       });
     }
 
@@ -323,7 +537,7 @@ app.get("/api/menu", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Internal server error",
-      error: error.message,
+      error: publicError(error),
     });
   }
 });
@@ -1345,14 +1559,26 @@ app.patch(
       };
       const newStatus = STATUS_MAP[delivery_status];
       if (!newStatus) {
-        return res.status(400).json({ success: false, message: "Invalid delivery status" });
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid delivery status" });
       }
 
-      const { data: result, error } = await adminTransitionOrder(id, newStatus, req.userId, reason);
+      const { data: result, error } = await adminTransitionOrder(
+        id,
+        newStatus,
+        req.userId,
+        reason,
+      );
 
       if (error) {
         console.error("transition_order_status RPC error:", error);
-        return res.status(500).json({ success: false, message: "Failed to update delivery status" });
+        return res
+          .status(500)
+          .json({
+            success: false,
+            message: "Failed to update delivery status",
+          });
       }
       if (!result.success) {
         const statusCode = result.code === "ORDER_NOT_FOUND" ? 404 : 400;
@@ -1363,7 +1589,9 @@ app.patch(
       // plain column updates, same as before.
       const metadataUpdate = { updated_at: new Date().toISOString() };
       if (delivery_status === "out_for_delivery") {
-        metadataUpdate.estimated_delivery_time = new Date(Date.now() + 30 * 60000);
+        metadataUpdate.estimated_delivery_time = new Date(
+          Date.now() + 30 * 60000,
+        );
       }
       if (delivery_status === "delivered") {
         metadataUpdate.actual_delivery_time = new Date().toISOString();
@@ -1386,14 +1614,20 @@ app.patch(
         // request, the status change is real and correct either way.
       }
 
-      res.json({ success: true, message: "Order updated", order: data, ...result });
+      res.json({
+        success: true,
+        message: "Order updated",
+        order: data,
+        ...result,
+      });
     } catch (error) {
       console.error("Delivery status update error:", error);
-      res.status(500).json({ success: false, message: "Failed to update delivery details" });
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to update delivery details" });
     }
   },
 );
-
 
 // Get delivery tracking info
 app.get("/api/orders/:id/track", authMiddleware, async (req, res) => {
@@ -1906,25 +2140,59 @@ app.patch(
   },
 );
 
-app.post("/api/admin/orders/:id/confirm", authMiddleware, adminMiddleware, async (req, res) => {
-  const { data: result, error } = await supabase.rpc("transition_order_status", {
-    p_order_id: req.params.id, p_new_status: "CONFIRMED",
-    p_actor_type: "admin", p_actor_id: req.userId, p_reason: req.body.reason || null,
-  });
-  if (error) return res.status(500).json({ success: false, message: "Failed to confirm order" });
-  if (!result.success) return res.status(result.code === "ORDER_NOT_FOUND" ? 404 : 400).json(result);
-  res.json({ success: true, ...result });
-});
+app.post(
+  "/api/admin/orders/:id/confirm",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    const { data: result, error } = await supabase.rpc(
+      "transition_order_status",
+      {
+        p_order_id: req.params.id,
+        p_new_status: "CONFIRMED",
+        p_actor_type: "admin",
+        p_actor_id: req.userId,
+        p_reason: req.body.reason || null,
+      },
+    );
+    if (error)
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to confirm order" });
+    if (!result.success)
+      return res
+        .status(result.code === "ORDER_NOT_FOUND" ? 404 : 400)
+        .json(result);
+    res.json({ success: true, ...result });
+  },
+);
 
-app.post("/api/admin/orders/:id/start-preparing", authMiddleware, adminMiddleware, async (req, res) => {
-  const { data: result, error } = await supabase.rpc("transition_order_status", {
-    p_order_id: req.params.id, p_new_status: "PREPARING",
-    p_actor_type: "admin", p_actor_id: req.userId, p_reason: req.body.reason || null,
-  });
-  if (error) return res.status(500).json({ success: false, message: "Failed to update order" });
-  if (!result.success) return res.status(result.code === "ORDER_NOT_FOUND" ? 404 : 400).json(result);
-  res.json({ success: true, ...result });
-});
+app.post(
+  "/api/admin/orders/:id/start-preparing",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    const { data: result, error } = await supabase.rpc(
+      "transition_order_status",
+      {
+        p_order_id: req.params.id,
+        p_new_status: "PREPARING",
+        p_actor_type: "admin",
+        p_actor_id: req.userId,
+        p_reason: req.body.reason || null,
+      },
+    );
+    if (error)
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to update order" });
+    if (!result.success)
+      return res
+        .status(result.code === "ORDER_NOT_FOUND" ? 404 : 400)
+        .json(result);
+    res.json({ success: true, ...result });
+  },
+);
 
 // Get staff performance metrics
 /*app.get(
@@ -2177,6 +2445,63 @@ app.post(
   },
 );
 
+// ============================================
+// ADMIN MENU DETAILS — Phase D
+// ============================================
+//
+// PUT /api/admin/menu/:id/details
+// Atomically replaces images / variant_groups / extras for an item.
+// Scalar fields (name, price, category, image_url, is_available,
+// badge, stock_count) stay on the existing PATCH /api/admin/menu/:id
+// route — this route owns the arrays only.
+app.put(
+  "/api/admin/menu/:id/details",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const isUuid =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+          id,
+        );
+      if (!isUuid)
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid item id" });
+
+      const { images, variant_groups, extras } = req.body || {};
+
+      const { data: result, error } = await supabase.rpc(
+        "admin_save_menu_details",
+        {
+          p_item_id: id,
+          p_images: Array.isArray(images) ? images : [],
+          p_variant_groups: Array.isArray(variant_groups) ? variant_groups : [],
+          p_extras: Array.isArray(extras) ? extras : [],
+          p_actor: req.userId,
+        },
+      );
+
+      if (error) {
+        console.error("admin_save_menu_details RPC error:", error);
+        return res
+          .status(500)
+          .json({ success: false, message: "Failed to save menu details" });
+      }
+      if (!result.success) {
+        return res.status(400).json(result);
+      }
+      res.json(result);
+    } catch (error) {
+      console.error("Save menu details error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to save menu details" });
+    }
+  },
+);
+
 app.patch(
   "/api/admin/menu/:id",
   authMiddleware,
@@ -2184,7 +2509,16 @@ app.patch(
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { name, description, price, category, image_url } = req.body;
+      const {
+        name,
+        description,
+        price,
+        category,
+        image_url,
+        is_available,
+        badge,
+        stock_count,
+      } = req.body;
 
       const updateData = {};
       if (name) updateData.name = name;
@@ -2192,6 +2526,14 @@ app.patch(
       if (price) updateData.price = parseFloat(price);
       if (category) updateData.category = category;
       if (image_url !== undefined) updateData.image_url = image_url;
+      // Phase D scalar additions:
+      if (is_available !== undefined)
+        updateData.is_available = Boolean(is_available);
+      if (badge !== undefined) updateData.badge = badge; // null clears it
+      if (stock_count !== undefined) {
+        updateData.stock_count =
+          stock_count === null ? null : parseInt(stock_count, 10);
+      }
       updateData.updated_at = new Date().toISOString();
 
       const { data, error } = await supabase
@@ -2275,162 +2617,174 @@ app.get(
   },
 );
 
+app.post(
+  "/api/orders",
+  authMiddleware,
+  requireActiveAccount,
+  requireLegalAcceptance("checkout"),
+  async (req, res) => {
+    try {
+      const {
+        items,
+        delivery_address,
+        delivery_phone,
+        delivery_instructions,
+        notes,
+        deliveryLocationId,
+        quoteId,
+        unregisteredDestination,
+      } = req.body;
+      const isUuidStr = (v) =>
+        typeof v === "string" &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+          v,
+        );
+      if (
+        (deliveryLocationId && !isUuidStr(deliveryLocationId)) ||
+        (quoteId && !isUuidStr(quoteId))
+      ) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid delivery area or quote" });
+      }
 
+      const headerKey = req.headers["idempotency-key"];
+      if (
+        headerKey !== undefined &&
+        !/^[A-Za-z0-9._:-]{8,128}$/.test(String(headerKey))
+      ) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid Idempotency-Key" });
+      }
+      const idempotencyKey = headerKey || uuidv4();
 
-/*app.post("/api/orders", authMiddleware, async (req, res) => {
-  try {
-    const { items, delivery_address, delivery_phone, delivery_instructions, notes } = req.body;
+      if (!Array.isArray(items) || !items.length) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Order must contain items" });
+      }
 
-    // Idempotency key: header first (once app.js sends one — see the
-    // frontend patch), falling back to a per-request UUID so this
-    // route still works before that frontend change ships. A
-    // fallback key protects nothing (it's different every call) but
-    // costs nothing either — real double-tap protection starts
-    // working the moment the frontend sends a stable key.
-    const idempotencyKey = req.headers["idempotency-key"] || uuidv4();
+      // Each line: { id, quantity, variant_ids?, extra_ids?, line_id? }
+      // name/price/specification from the client are still ignored —
+      // create_and_pay_order() re-fetches every price itself.
+      const itemsForFn = items.map((i) => ({
+        id: i && i.id,
+        quantity: i && i.quantity,
+        variant_ids: Array.isArray(i && i.variant_ids)
+          ? i.variant_ids
+          : undefined,
+        extra_ids: Array.isArray(i && i.extra_ids) ? i.extra_ids : undefined,
+        line_id: typeof (i && i.line_id) === "string" ? i.line_id : undefined,
+      }));
 
-    if (!items || !items.length) {
-      return res.status(400).json({ success: false, message: "Order must contain items" });
-    }
+      const anyHasOptions = itemsForFn.some(
+        (x) =>
+          (Array.isArray(x.variant_ids) && x.variant_ids.length > 0) ||
+          (Array.isArray(x.extra_ids) && x.extra_ids.length > 0),
+      );
 
-    // Client sends {id, quantity} per item (and, harmlessly, price/name —
-    // ignored entirely). create_and_pay_order() re-fetches every price
-    // from menu_items itself; nothing from req.body ever reaches the
-    // ledger.
-    const itemsForFn = items.map((i) => ({ id: i.id, quantity: i.quantity }));
-
-    const { data: result, error } = await supabase.rpc("create_and_pay_order", {
-      p_idempotency_key: idempotencyKey,
-      p_user_id: req.userId,
-      p_items: itemsForFn,
-      p_delivery_address: delivery_address || null,
-      p_delivery_phone: delivery_phone || null,
-      p_delivery_instructions: delivery_instructions || null,
-      p_notes: notes || null,
-    });
-
-    if (error) {
-      console.error("create_and_pay_order RPC error:", error);
-      return res.status(500).json({ success: false, message: "Failed to create order" });
-    }
-
-    if (!result.success) {
-      const statusByCode = {
-        EMPTY_CART: 400,
-        INVALID_QUANTITY: 400,
-        ITEM_NOT_FOUND: 400,
-        INVALID_TOTAL: 400,
-        USER_NOT_FOUND: 404,
-        INSUFFICIENT_BALANCE: 400,
+      const rpcArgs = {
+        p_idempotency_key: idempotencyKey,
+        p_user_id: req.userId,
+        p_items: anyHasOptions ? null : itemsForFn,
+        p_delivery_address: delivery_address || null,
+        p_delivery_phone: delivery_phone || null,
+        p_delivery_instructions: delivery_instructions || null,
+        p_notes: notes || null,
+        p_delivery_location_id: deliveryLocationId || null,
+        p_delivery_quote_id: quoteId || null,
+        p_unregistered_destination:
+          typeof unregisteredDestination === "string"
+            ? unregisteredDestination.trim().slice(0, 120) || null
+            : null,
+        p_items_with_options: anyHasOptions ? itemsForFn : null,
       };
-      return res.status(statusByCode[result.code] || 500).json(result);
-    }
 
-    // Fire-and-forget notification — matches spec's "financial success
-    // is independent of notification success." Not awaited critically:
-    // if this insert fails, the order is still PAID and the response
-    // below is unaffected. A real outbox/retry worker is a later phase;
-    // this is the minimum viable version of "don't let this block or
-    // fail the financial transaction."
-    supabase
-      .from("payment_notifications")
-      .insert([
-        {
-          user_id: req.userId,
-          type: "payment_success",
-          title: "Order Placed Successfully 🎉",
-          message: `Your order #${result.order.id} has been placed. ₦${Number(result.order.total).toFixed(2)} has been deducted from your wallet.`,
-          reference: result.order.id,
-          created_at: new Date().toISOString(),
-        },
-      ])
-      .then(({ error: notifErr }) => {
-        if (notifErr) console.error("Order notification insert failed (non-fatal):", notifErr);
+      let { data: result, error } = await supabase.rpc(
+        "create_and_pay_order",
+        rpcArgs,
+      );
+
+      if (
+        error &&
+        (error.code === "23505" || /idempotency/i.test(error.message || ""))
+      ) {
+        ({ data: result, error } = await supabase.rpc(
+          "create_and_pay_order",
+          rpcArgs,
+        ));
+      }
+
+      if (error) {
+        console.error("create_and_pay_order RPC error:", error);
+        return res
+          .status(500)
+          .json({ success: false, message: "Failed to create order" });
+      }
+
+      if (!result.success) {
+        const statusByCode = {
+          EMPTY_CART: 400,
+          INVALID_QUANTITY: 400,
+          ITEM_NOT_FOUND: 400,
+          INVALID_TOTAL: 400,
+          USER_NOT_FOUND: 404,
+          INSUFFICIENT_BALANCE: 400,
+          DELIVERY_FEE_CHANGED: 409,
+          INVALID_QUOTE: 409,
+          QUOTE_REQUIRED: 400,
+          DELIVERY_LOCATION_REQUIRED: 400,
+          NO_DELIVERY_FEE: 422,
+          LOCATION_INACTIVE: 422,
+          // Option-B variant & extras error codes from resolve_item_price:
+          VARIANT_INVALID: 400,
+          VARIANT_UNAVAILABLE: 409,
+          GROUP_INACTIVE: 409,
+          GROUP_MIN_UNMET: 400,
+          GROUP_MAX_EXCEEDED: 400,
+          EXTRA_INVALID: 400,
+          EXTRA_UNAVAILABLE: 409,
+          STOCK_LIMIT_EXCEEDED: 409,
+          ITEM_UNAVAILABLE: 409,
+        };
+        return res.status(statusByCode[result.code] || 500).json(result);
+      }
+
+      if (result.duplicate) {
+        const { data: dupOwner } = await supabase
+          .from("orders")
+          .select("user_id")
+          .eq("id", result.order && result.order.id)
+          .maybeSingle();
+        if (!dupOwner || dupOwner.user_id !== req.userId) {
+          return res
+            .status(409)
+            .json({ success: false, message: "Idempotency key already used" });
+        }
+      }
+
+      res.status(result.duplicate ? 200 : 201).json({
+        success: true,
+        message: result.duplicate
+          ? "Order already processed"
+          : "Order created successfully",
+        order: result.order,
+        balance_after: result.balance_after,
+        transaction_id: result.transaction_id,
+        ledger_entry_id: result.ledger_entry_id,
       });
-
-    res.status(result.duplicate ? 200 : 201).json({
-      success: true,
-      message: result.duplicate ? "Order already processed" : "Order created successfully",
-      order: result.order,
-      balance_after: result.balance_after,
-      transaction_id: result.transaction_id,
-      ledger_entry_id: result.ledger_entry_id,
-    });
-  } catch (error) {
-    console.error("Order error:", error);
-    res.status(500).json({ success: false, message: error.message || "Failed to create order" });
-  }
-});*/
-
-app.post("/api/orders", authMiddleware, async (req, res) => {
-  try {
-    const { items, delivery_address, delivery_phone, delivery_instructions, notes } = req.body;
-
-    // Idempotency key: header first (once app.js sends one — see the
-    // frontend patch), falling back to a per-request UUID so this
-    // route still works before that frontend change ships. A
-    // fallback key protects nothing (it's different every call) but
-    // costs nothing either — real double-tap protection starts
-    // working the moment the frontend sends a stable key.
-    const idempotencyKey = req.headers["idempotency-key"] || uuidv4();
-
-    if (!items || !items.length) {
-      return res.status(400).json({ success: false, message: "Order must contain items" });
+    } catch (error) {
+      console.error("Order error:", error);
+      res
+        .status(500)
+        .json({
+          success: false,
+          message: publicErrorMessage(error, "Failed to create order"),
+        });
     }
-
-    // Client sends {id, quantity} per item (and, harmlessly, price/name —
-    // ignored entirely). create_and_pay_order() re-fetches every price
-    // from menu_items itself; nothing from req.body ever reaches the
-    // ledger.
-    const itemsForFn = items.map((i) => ({ id: i.id, quantity: i.quantity }));
-
-    const { data: result, error } = await supabase.rpc("create_and_pay_order", {
-      p_idempotency_key: idempotencyKey,
-      p_user_id: req.userId,
-      p_items: itemsForFn,
-      p_delivery_address: delivery_address || null,
-      p_delivery_phone: delivery_phone || null,
-      p_delivery_instructions: delivery_instructions || null,
-      p_notes: notes || null,
-    });
-
-    if (error) {
-      console.error("create_and_pay_order RPC error:", error);
-      return res.status(500).json({ success: false, message: "Failed to create order" });
-    }
-
-    if (!result.success) {
-      const statusByCode = {
-        EMPTY_CART: 400,
-        INVALID_QUANTITY: 400,
-        ITEM_NOT_FOUND: 400,
-        INVALID_TOTAL: 400,
-        USER_NOT_FOUND: 404,
-        INSUFFICIENT_BALANCE: 400,
-      };
-      return res.status(statusByCode[result.code] || 500).json(result);
-    }
-
-    // Notification is no longer inserted here directly — it's now a
-    // retryable background_jobs row (send_push_notification), fanned
-    // out from the ORDER_PAID outbox event create_and_pay_order()
-    // writes atomically alongside the order itself (see 008 and
-    // frozyla-job-worker.js). A cron-triggered worker batch picks it
-    // up within seconds; no code in this route needs to know that.
-
-    res.status(result.duplicate ? 200 : 201).json({
-      success: true,
-      message: result.duplicate ? "Order already processed" : "Order created successfully",
-      order: result.order,
-      balance_after: result.balance_after,
-      transaction_id: result.transaction_id,
-      ledger_entry_id: result.ledger_entry_id,
-    });
-  } catch (error) {
-    console.error("Order error:", error);
-    res.status(500).json({ success: false, message: error.message || "Failed to create order" });
-  }
-});
+  },
+);
 
 app.get("/api/orders", authMiddleware, async (req, res) => {
   try {
@@ -2484,7 +2838,9 @@ app.get("/api/orders/:id/delivery-pin", authMiddleware, async (req, res) => {
       .maybeSingle();
     if (orderErr) throw orderErr;
     if (!order) {
-      return res.status(404).json({ success: false, message: "Order not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Order not found" });
     }
 
     const base = { success: true, order_id: order.id, status: order.status };
@@ -2504,10 +2860,16 @@ app.get("/api/orders/:id/delivery-pin", authMiddleware, async (req, res) => {
       return res.json({ ...base, pin_available: false });
     }
 
-    res.json({ ...base, pin_available: true, delivery_pin: verification.delivery_pin });
+    res.json({
+      ...base,
+      pin_available: true,
+      delivery_pin: verification.delivery_pin,
+    });
   } catch (error) {
     console.error("Delivery PIN fetch error:", error);
-    res.status(500).json({ success: false, message: "Failed to load delivery code" });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to load delivery code" });
   }
 });
 
@@ -2617,21 +2979,54 @@ app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
     // no half-cancelled state and no race with an admin pressing
     // "Preparing" at the same moment.
     if (["cancelled", "CANCELLED", "CANCELLATION_PENDING"].includes(status)) {
-      const { data: cancelResult, error: cancelErr } = await supabase.rpc("cancel_paid_order", {
-        p_order_id: id,
-        p_actor_type: isAdmin ? "admin" : "customer",
-        p_actor_id: req.userId,
-        p_reason: reason || null,
-      });
+      // Ownership is enforced HERE, before any state-changing call, so it does
+      // not depend on what cancel_paid_order() does with p_actor_id (that SQL
+      // body is not in the repository's setup.sql). Non-owners get 404, not 403,
+      // so order ids cannot be probed.
+      if (!isAdmin) {
+        const { data: owned, error: ownErr } = await supabase
+          .from("orders")
+          .select("user_id")
+          .eq("id", id)
+          .maybeSingle();
+        if (ownErr) {
+          console.error("cancel ownership lookup failed:", ownErr);
+          return res
+            .status(500)
+            .json({ success: false, message: "Failed to cancel order" });
+        }
+        if (!owned || owned.user_id !== req.userId) {
+          return res
+            .status(404)
+            .json({ success: false, message: "Order not found" });
+        }
+      }
+      const { data: cancelResult, error: cancelErr } = await supabase.rpc(
+        "cancel_paid_order",
+        {
+          p_order_id: id,
+          p_actor_type: isAdmin ? "admin" : "customer",
+          p_actor_id: req.userId,
+          p_reason: reason || null,
+        },
+      );
       if (cancelErr) {
         console.error("cancel_paid_order RPC error:", cancelErr);
-        return res.status(500).json({ success: false, message: "Failed to cancel order" });
+        return res
+          .status(500)
+          .json({ success: false, message: "Failed to cancel order" });
       }
       if (!cancelResult.success) {
         const httpByCode = { ORDER_NOT_FOUND: 404, NOT_CANCELLABLE: 409 };
-        return res.status(httpByCode[cancelResult.code] || 400).json(cancelResult);
+        return res
+          .status(httpByCode[cancelResult.code] || 400)
+          .json(cancelResult);
       }
-      return res.json({ success: true, message: "Order cancelled and refunded", ...cancelResult });
+      return res.json({
+        success: true,
+        message: "Order cancelled and refunded",
+        ...cancelResult,
+      });
     }
 
     // Customers may only ever request cancellation. Admins/staff get
@@ -2639,7 +3034,8 @@ app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
     if (!isAdmin && status !== "CANCELLATION_PENDING") {
       return res.status(403).json({
         success: false,
-        message: "Customers can only request cancellation. Use the admin endpoint for other status changes.",
+        message:
+          "Customers can only request cancellation. Use the admin endpoint for other status changes.",
       });
     }
 
@@ -2647,9 +3043,15 @@ app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
       // Ownership check stays — transition_order_status() itself
       // doesn't know or care who's asking, only whether the
       // FROM->TO transition is valid.
-      const { data: order } = await supabase.from("orders").select("user_id").eq("id", id).maybeSingle();
+      const { data: order } = await supabase
+        .from("orders")
+        .select("user_id")
+        .eq("id", id)
+        .maybeSingle();
       if (!order || order.user_id !== req.userId) {
-        return res.status(404).json({ success: false, message: "Order not found" });
+        return res
+          .status(404)
+          .json({ success: false, message: "Order not found" });
       }
     }
 
@@ -2665,7 +3067,9 @@ app.patch("/api/orders/:id/status", authMiddleware, async (req, res) => {
 
     if (error) {
       console.error("transition_order_status RPC error:", error);
-      return res.status(500).json({ success: false, message: "Failed to update order" });
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to update order" });
     }
     if (!result.success) {
       const statusCode = result.code === "ORDER_NOT_FOUND" ? 404 : 400;
@@ -2710,7 +3114,9 @@ app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
       .single();
 
     if (error || !user) {
-      return res.status(404).json({ success: false, message: "User not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
     }
 
     // Stage 1 monitoring — compares against the new ledger on every
@@ -2721,7 +3127,10 @@ app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
     // silently on any error.
     if (process.env.GL_WALLET_BALANCE_MONITOR === "true") {
       compareWalletBalanceToLedger(req.userId, user.balance).catch((err) =>
-        console.error("[GL-MONITOR] Balance comparison failed (non-fatal):", err),
+        console.error(
+          "[GL-MONITOR] Balance comparison failed (non-fatal):",
+          err,
+        ),
       );
     }
 
@@ -2736,7 +3145,9 @@ app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error("Get wallet balance error:", error);
-    res.status(500).json({ success: false, message: "Failed to load wallet balance" });
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to load wallet balance" });
   }
 });
 
@@ -2749,14 +3160,27 @@ app.get("/api/wallet/balance", authMiddleware, async (req, res) => {
 // instead of waiting for the next scheduled sweep.
 async function compareWalletBalanceToLedger(userId, usersBalanceValue) {
   const ledgerService = require("../lib/ledger-service");
-  const glBalance = await ledgerService.getAccountBalance({ accountCode: "2000", ownerId: userId });
-  const difference = Math.round((Number(usersBalanceValue) - Number(glBalance.ledger_balance)) * 100) / 100;
+  const glBalance = await ledgerService.getAccountBalance({
+    accountCode: "2000",
+    ownerId: userId,
+  });
+  const difference =
+    Math.round(
+      (Number(usersBalanceValue) - Number(glBalance.ledger_balance)) * 100,
+    ) / 100;
 
   if (Math.abs(difference) > 0.01) {
-    console.warn(`[GL-MONITOR] Balance mismatch for user ${userId}: users.balance=${usersBalanceValue}, gl=${glBalance.ledger_balance}, diff=${difference}`);
+    console.warn(
+      `[GL-MONITOR] Balance mismatch for user ${userId}: users.balance=${usersBalanceValue}, gl=${glBalance.ledger_balance}, diff=${difference}`,
+    );
     await ledgerService.createInvestigationCase({
       caseType: "WALLET_BALANCE_ENDPOINT_MISMATCH",
-      severity: Math.abs(difference) > 10000 ? "CRITICAL" : Math.abs(difference) > 100 ? "HIGH" : "MEDIUM",
+      severity:
+        Math.abs(difference) > 10000
+          ? "CRITICAL"
+          : Math.abs(difference) > 100
+            ? "HIGH"
+            : "MEDIUM",
       accountCode: "2000",
       ownerId: userId,
       expectedAmount: glBalance.ledger_balance,
@@ -2851,7 +3275,7 @@ app.get("/api/wallet/transactions/:id", authMiddleware, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch transaction",
-      error: error.message,
+      error: publicError(error),
     });
   }
 });
@@ -2922,7 +3346,7 @@ app.get("/api/wallet/transactions", authMiddleware, async (req, res) => {
       return res.status(500).json({
         success: false,
         message: "Failed to fetch transactions",
-        error: error.message,
+        error: publicError(error),
       });
     }
 
@@ -3000,32 +3424,59 @@ app.get("/api/wallet/transactions", authMiddleware, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch transactions",
-      error: error.message,
+      error: publicError(error),
     });
   }
 });
+
+// ---------------------------------------------------------------
+// Saved cards: Frozyla NEVER stores a card number.
+// payment_cards keeps only display data (brand, last four digits,
+// expiry, holder name) plus provider_ref, an opaque reference issued by
+// the payment provider side (Feecent/Flutterwave). cardView() is the only
+// shape a card leaves this server in. `card_number` is still returned,
+// as a masked string built from last4, purely so older app and admin
+// screens that read card.card_number.slice(-4) keep rendering.
+// ---------------------------------------------------------------
+function cardView(card) {
+  if (!card) return null;
+  const last4 = card.last4 || "";
+  return {
+    id: card.id,
+    card_holder_name: card.card_holder_name,
+    expiry_month: card.expiry_month,
+    expiry_year: card.expiry_year,
+    card_type: card.card_type,
+    last4,
+    card_number: last4 ? `**** **** **** ${last4}` : "****",
+    is_default: card.is_default,
+    is_verified: card.is_verified,
+    // A card can only pay if the provider side holds a token for it.
+    // Cards saved by the old flow have no provider_ref and cannot be used.
+    usable: Boolean(card.provider_ref),
+    created_at: card.created_at,
+  };
+}
+const CARD_COLUMNS =
+  "id, card_holder_name, expiry_month, expiry_year, card_type, last4, is_default, is_verified, provider_ref, created_at";
 
 // Get user cards
 app.get("/api/wallet/cards", authMiddleware, async (req, res) => {
   try {
     const { data: cards, error } = await supabase
       .from("payment_cards")
-      .select("*")
+      .select(CARD_COLUMNS)
       .eq("user_id", req.userId)
       .order("is_default", { ascending: false })
       .order("created_at", { ascending: false });
 
     if (error) throw error;
 
-    // Mask card numbers
-    const maskedCards = (cards || []).map((card) => ({
-      ...card,
-      card_number: card.card_number.replace(/\d(?=\d{4})/g, "*"),
-    }));
-
     res.json({
       success: true,
-      cards: maskedCards,
+      cards: (cards || []).map(cardView),
+      // The app only shows "Save this card" / saved-card payment when this is true.
+      savingEnabled: savedCards.savingEnabled(),
     });
   } catch (error) {
     console.error("Get cards error:", error);
@@ -3037,6 +3488,26 @@ app.get("/api/wallet/cards", authMiddleware, async (req, res) => {
 });
 
 // Add payment card
+//
+// RETIRED. This route used to accept a full card number and store it.
+// It now refuses outright: a card number must never reach this server.
+// Cards are saved through the provider's hosted checkout instead (the
+// "Save this card" option when funding with a card), which gives back
+// only a reference. Old app builds get a clear message, not a 404.
+app.post("/api/wallet/cards", authMiddleware, async (req, res) => {
+  // Do not log req.body here: it may contain a card number from an old client.
+  return res.status(410).json({
+    success: false,
+    code: "CARD_ENTRY_RETIRED",
+    message:
+      'Cards can no longer be added by typing the number into the app. Fund your wallet with a card and choose "Save this card" on the secure payment page.',
+  });
+});
+
+/* DEAD CODE (kept, flagged): the previous handler, which validated the
+   expiry date, cleared other defaults and inserted card_number into
+   payment_cards. Unreachable now. Delete once you are happy with the new
+   flow.
 app.post("/api/wallet/cards", authMiddleware, async (req, res) => {
   try {
     const {
@@ -3114,6 +3585,8 @@ app.post("/api/wallet/cards", authMiddleware, async (req, res) => {
   }
 });
 
+*/
+
 // Set default card
 app.patch("/api/wallet/cards/:id/default", authMiddleware, async (req, res) => {
   try {
@@ -3148,17 +3621,15 @@ app.patch("/api/wallet/cards/:id/default", authMiddleware, async (req, res) => {
         updated_at: new Date().toISOString(),
       })
       .eq("id", id)
-      .select()
+      .select(CARD_COLUMNS)
       .single();
 
     if (error) throw error;
 
-    card.card_number = card.card_number.replace(/\d(?=\d{4})/g, "*");
-
     res.json({
       success: true,
       message: "Default card updated",
-      card: card,
+      card: cardView(card),
     });
   } catch (error) {
     console.error("Set default card error:", error);
@@ -3170,33 +3641,72 @@ app.patch("/api/wallet/cards/:id/default", authMiddleware, async (req, res) => {
 });
 
 // Delete card
+// A provider-backed card is revoked at Feecent FIRST. If that fails we keep
+// the row and say so, because deleting only our copy would leave the token
+// alive at the provider with no way left to ask for it to be removed.
 app.delete("/api/wallet/cards/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
+
+    const { data: card, error: findErr } = await supabase
+      .from("payment_cards")
+      .select("id, provider_ref")
+      .eq("id", id)
+      .eq("user_id", req.userId)
+      .maybeSingle();
+    if (findErr) throw findErr;
+    if (!card)
+      return res
+        .status(404)
+        .json({ success: false, message: "Card not found" });
+
+    if (card.provider_ref) {
+      const { data: user } = await supabase
+        .from("users")
+        .select("account_number")
+        .eq("id", req.userId)
+        .single();
+      const revoked = await feecentPaymentsClient.deleteSavedCard({
+        frozylaUserId: user?.account_number,
+        cardRef: card.provider_ref,
+      });
+      // "Already gone" is a fine outcome for a delete.
+      if (!revoked.success && revoked.code !== "CARD_NOT_FOUND") {
+        console.error("Revoke saved card failed:", revoked.code, revoked.error);
+        return res.status(502).json({
+          success: false,
+          message:
+            "We couldn't remove this card right now. Please try again in a moment.",
+        });
+      }
+    }
 
     const { error } = await supabase
       .from("payment_cards")
       .delete()
       .eq("id", id)
       .eq("user_id", req.userId);
-
     if (error) throw error;
 
-    res.json({
-      success: true,
-      message: "Card deleted successfully",
-    });
+    res.json({ success: true, message: "Card deleted successfully" });
   } catch (error) {
     console.error("Delete card error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to delete card",
-    });
+    res.status(500).json({ success: false, message: "Failed to delete card" });
   }
 });
 
 // Create card funding request
 app.post("/api/wallet/fund", authMiddleware, async (req, res) => {
+  // RETIRED: this created a funding request that an admin approved by hand,
+  // so wallet credit could be granted without any money actually moving.
+  // Real card funding is POST /api/wallet/fund-card (hosted checkout).
+  // The original handler below is now DEAD CODE, kept for you to review.
+  return res.status(410).json({
+    success: false,
+    code: "MANUAL_FUNDING_RETIRED",
+    message: "Please use Fund with card to add money to your wallet.",
+  });
+  // eslint-disable-next-line no-unreachable
   try {
     const { card_id, amount } = req.body;
 
@@ -3314,107 +3824,386 @@ app.post("/api/wallet/fund", authMiddleware, async (req, res) => {
 // returns a Flutterwave-hosted checkout URL, and this app only ever
 // asks "what's the status of reference X" afterward.
 // ------------------------------------------------------------
-app.post("/api/wallet/fund-card", authMiddleware, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    const amountNum = parseFloat(amount);
-    if (!amountNum || amountNum <= 0) {
-      return res.status(400).json({ success: false, message: "Invalid amount" });
-    }
-
-    // Same min/max settings the old flow already enforced — reused
-    // as-is rather than duplicated with different numbers.
-    const { data: settings } = await supabase
-      .from("payment_settings")
-      .select("key, value")
-      .in("key", ["min_funding_amount", "max_funding_amount"]);
-    const minFunding = parseFloat(settings?.find((s) => s.key === "min_funding_amount")?.value || "10");
-    const maxFunding = parseFloat(settings?.find((s) => s.key === "max_funding_amount")?.value || "100000");
-    if (amountNum < minFunding) {
-      return res.status(400).json({ success: false, message: `Minimum funding amount is ₦${minFunding.toFixed(2)}` });
-    }
-    if (amountNum > maxFunding) {
-      return res.status(400).json({ success: false, message: `Maximum funding amount is ₦${maxFunding.toFixed(2)}` });
-    }
-
-    const { data: user, error: userError } = await supabase
-      .from("users")
-      .select("account_number")
-      .eq("id", req.userId)
-      .single();
-    if (userError || !user || !user.account_number) {
-      return res.status(500).json({ success: false, message: "Could not resolve your account for funding" });
-    }
-
-    const amountMinor = Math.round(amountNum * 100); // naira -> kobo, once, at this boundary
-    const idempotencyKey = uuidv4();
-
-    const checkout = await feecentPaymentsClient.createCheckout({
-      frozylaUserId: user.account_number,
-      amountMinor,
-      currency: "NGN",
-      idempotencyKey,
-    });
-
-    if (!checkout.success) {
-      if (checkout.code === "CARD_FUNDING_DISABLED") {
-        return res.status(503).json({ success: false, message: "Card funding is not available right now." });
+app.post(
+  "/api/wallet/fund-card",
+  authMiddleware,
+  requireActiveAccount,
+  async (req, res) => {
+    try {
+      const { amount, saveCard } = req.body;
+      const amountNum = parseFloat(amount);
+      if (!amountNum || amountNum <= 0) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid amount" });
       }
-      console.error("Card funding checkout error:", checkout.error);
-      return res.status(502).json({ success: false, message: "Could not start card funding. Please try again." });
-    }
 
-    res.json({
-      success: true,
-      reference: checkout.reference,
-      checkoutUrl: checkout.checkoutUrl,
-    });
-  } catch (error) {
-    console.error("Fund with card error:", error);
-    res.status(500).json({ success: false, message: "Failed to start card funding" });
-  }
-});
+      // Same min/max settings the old flow already enforced — reused
+      // as-is rather than duplicated with different numbers.
+      const { data: settings } = await supabase
+        .from("payment_settings")
+        .select("key, value")
+        .in("key", ["min_funding_amount", "max_funding_amount"]);
+      const minFunding = parseFloat(
+        settings?.find((s) => s.key === "min_funding_amount")?.value || "10",
+      );
+      const maxFunding = parseFloat(
+        settings?.find((s) => s.key === "max_funding_amount")?.value ||
+          "100000",
+      );
+      if (amountNum < minFunding) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: `Minimum funding amount is ₦${minFunding.toFixed(2)}`,
+          });
+      }
+      if (amountNum > maxFunding) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: `Maximum funding amount is ₦${maxFunding.toFixed(2)}`,
+          });
+      }
 
-app.get("/api/wallet/fund-card/status/:reference", authMiddleware, async (req, res) => {
-  try {
-    const { data: user, error: userError } = await supabase
-      .from("users")
-      .select("account_number")
-      .eq("id", req.userId)
-      .single();
-    if (userError || !user) {
-      return res.status(404).json({ success: false, message: "User not found" });
-    }
+      const { data: user, error: userError } = await supabase
+        .from("users")
+        .select("account_number")
+        .eq("id", req.userId)
+        .single();
+      if (userError || !user || !user.account_number) {
+        return res
+          .status(500)
+          .json({
+            success: false,
+            message: "Could not resolve your account for funding",
+          });
+      }
 
-    const result = await feecentPaymentsClient.getStatus(req.params.reference);
-    if (result.notFound) {
-      return res.status(404).json({ success: false, message: "Funding reference not found" });
-    }
-    if (!result.success) {
-      console.error("Card funding status error:", result.error);
-      return res.status(502).json({ success: false, message: "Could not check funding status" });
-    }
+      const amountMinor = Math.round(amountNum * 100); // naira -> kobo, once, at this boundary
+      const idempotencyKey = uuidv4();
 
-    // Ownership check: this reference must belong to THIS user's
-    // account_number. references are unguessable UUIDs, but this
-    // closes the gap anyway rather than relying on that alone — see
-    // CARD_FUNDING_COMPLIANCE.md.
-    if (result.data.frozylaUserId !== user.account_number) {
-      return res.status(404).json({ success: false, message: "Funding reference not found" });
-    }
+      const checkout = await feecentPaymentsClient.createCheckout({
+        frozylaUserId: user.account_number,
+        amountMinor,
+        currency: "NGN",
+        idempotencyKey,
+        // Only honoured when saving is switched on AND the customer ticked the box.
+        saveCard: savedCards.savingEnabled() && saveCard === true,
+      });
 
-    res.json({
-      success: true,
-      status: result.data.status,
-      amountMinor: result.data.amountMinor,
-      currency: result.data.currency,
-      failureReason: result.data.failureReason,
-    });
-  } catch (error) {
-    console.error("Fund with card status error:", error);
-    res.status(500).json({ success: false, message: "Failed to check funding status" });
-  }
-});
+      if (!checkout.success) {
+        if (checkout.code === "CARD_FUNDING_DISABLED") {
+          return res
+            .status(503)
+            .json({
+              success: false,
+              message: "Card funding is not available right now.",
+            });
+        }
+        console.error("Card funding checkout error:", checkout.error);
+        return res
+          .status(502)
+          .json({
+            success: false,
+            message: "Could not start card funding. Please try again.",
+          });
+      }
+
+      res.json({
+        success: true,
+        reference: checkout.reference,
+        checkoutUrl: checkout.checkoutUrl,
+      });
+    } catch (error) {
+      console.error("Fund with card error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to start card funding" });
+    }
+  },
+);
+
+app.get(
+  "/api/wallet/fund-card/status/:reference",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const { data: user, error: userError } = await supabase
+        .from("users")
+        .select("account_number, name")
+        .eq("id", req.userId)
+        .single();
+      if (userError || !user) {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found" });
+      }
+
+      const result = await feecentPaymentsClient.getStatus(
+        req.params.reference,
+      );
+      if (result.notFound) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Funding reference not found" });
+      }
+      if (!result.success) {
+        console.error("Card funding status error:", result.error);
+        return res
+          .status(502)
+          .json({ success: false, message: "Could not check funding status" });
+      }
+
+      // Ownership check: this reference must belong to THIS user's
+      // account_number. references are unguessable UUIDs, but this
+      // closes the gap anyway rather than relying on that alone — see
+      // CARD_FUNDING_COMPLIANCE.md.
+      if (result.data.frozylaUserId !== user.account_number) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Funding reference not found" });
+      }
+
+      // If the customer ticked "Save this card" and the payment went through,
+      // Feecent includes an opaque card reference. Keep it (idempotent: this
+      // endpoint is polled, so the same success is seen many times).
+      let cardSaved = false;
+      if (
+        savedCards.savingEnabled() &&
+        ["SUCCESS", "CREDITED"].includes(result.data.status) &&
+        result.data.card
+      ) {
+        try {
+          const saved = await savedCards.persistSavedCard({
+            supabase,
+            userId: req.userId,
+            userName: user.name,
+            feecentCard: result.data.card,
+          });
+          cardSaved = saved.saved === true;
+        } catch (e) {
+          // Never let a card-saving problem hide a successful payment.
+          console.error("Save card after funding error:", e);
+        }
+      }
+
+      res.json({
+        success: true,
+        status: result.data.status,
+        amountMinor: result.data.amountMinor,
+        currency: result.data.currency,
+        failureReason: result.data.failureReason,
+        cardSaved,
+      });
+    } catch (error) {
+      console.error("Fund with card status error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to check funding status" });
+    }
+  },
+);
+
+// Pay with a saved card.
+//
+// Frozyla never sees a card number or a chargeable token. This route names a
+// card by its saved id; Feecent resolves it to the provider token (checking
+// the card really belongs to this customer) and starts the charge. The
+// wallet is credited by the same pipeline as hosted checkout, so the app
+// simply polls GET /wallet/fund-card/status/:reference afterwards.
+//
+// Charging a card without the customer typing anything is the riskiest thing
+// this app does, so:
+//   - an Idempotency-Key header is REQUIRED (a double tap or retry must not
+//     charge twice) and is bound to this customer + card + amount;
+//   - the same min/max limits as hosted checkout apply;
+//   - an uncertain result (network cut mid-request) is reported as
+//     "checking", never as "failed", so the customer doesn't pay twice.
+app.post(
+  "/api/wallet/fund-saved-card",
+  authMiddleware,
+  requireActiveAccount,
+  async (req, res) => {
+    try {
+      if (!savedCards.savingEnabled()) {
+        return res
+          .status(503)
+          .json({
+            success: false,
+            message: "Saved cards are not available right now.",
+          });
+      }
+
+      const { cardId, amount } = req.body || {};
+      const amountNum = parseFloat(amount);
+      if (!cardId || !amountNum || amountNum <= 0) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: "Choose a card and enter a valid amount",
+          });
+      }
+
+      const clientKey = String(req.headers["idempotency-key"] || "").trim();
+      if (!/^[A-Za-z0-9_-]{8,100}$/.test(clientKey)) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: "Missing or invalid Idempotency-Key header",
+          });
+      }
+
+      const { data: settings } = await supabase
+        .from("payment_settings")
+        .select("key, value")
+        .in("key", ["min_funding_amount", "max_funding_amount"]);
+      const minFunding = parseFloat(
+        settings?.find((s) => s.key === "min_funding_amount")?.value || "10",
+      );
+      const maxFunding = parseFloat(
+        settings?.find((s) => s.key === "max_funding_amount")?.value ||
+          "100000",
+      );
+      if (amountNum < minFunding) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: `Minimum funding amount is ₦${minFunding.toFixed(2)}`,
+          });
+      }
+      if (amountNum > maxFunding) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: `Maximum funding amount is ₦${maxFunding.toFixed(2)}`,
+          });
+      }
+
+      // The card must be THIS customer's, and must be a provider-backed card.
+      const { data: card, error: cardErr } = await supabase
+        .from("payment_cards")
+        .select("id, provider_ref, expiry_month, expiry_year")
+        .eq("id", cardId)
+        .eq("user_id", req.userId)
+        .maybeSingle();
+      if (cardErr) throw cardErr;
+      if (!card)
+        return res
+          .status(404)
+          .json({ success: false, message: "Card not found" });
+      if (!card.provider_ref) {
+        return res.status(409).json({
+          success: false,
+          code: "LEGACY_CARD",
+          message:
+            'This card can\'t be used for payments. Fund with a card and choose "Save this card" to add it again.',
+        });
+      }
+      const endOfExpiryMonth = new Date(
+        parseInt(card.expiry_year, 10),
+        parseInt(card.expiry_month, 10),
+        1,
+      );
+      if (endOfExpiryMonth <= new Date()) {
+        return res
+          .status(409)
+          .json({
+            success: false,
+            code: "CARD_EXPIRED",
+            message: "This card has expired.",
+          });
+      }
+
+      const { data: user, error: userError } = await supabase
+        .from("users")
+        .select("account_number")
+        .eq("id", req.userId)
+        .single();
+      if (userError || !user || !user.account_number) {
+        return res
+          .status(500)
+          .json({
+            success: false,
+            message: "Could not resolve your account for funding",
+          });
+      }
+
+      const amountMinor = Math.round(amountNum * 100);
+      const idempotencyKey = require("crypto")
+        .createHash("sha256")
+        .update(`${req.userId}:${card.id}:${amountMinor}:${clientKey}`)
+        .digest("hex")
+        .slice(0, 48);
+
+      const charge = await feecentPaymentsClient.chargeSavedCard({
+        frozylaUserId: user.account_number,
+        cardRef: card.provider_ref,
+        amountMinor,
+        currency: "NGN",
+        idempotencyKey,
+      });
+
+      if (charge.uncertain) {
+        // 202 Accepted: we don't know the outcome yet. Not an error status on
+        // purpose, so the app shows "checking" instead of "failed".
+        return res.status(202).json({
+          success: false,
+          uncertain: true,
+          message:
+            "We couldn't confirm whether the payment started. Check your wallet in a minute before trying again.",
+        });
+      }
+      if (!charge.success) {
+        const byCode = {
+          NOT_SUPPORTED: [503, "Saved cards are not available right now."],
+          CARD_FUNDING_DISABLED: [
+            503,
+            "Card funding is not available right now.",
+          ],
+          CARD_NOT_FOUND: [404, "Card not found"],
+          CARD_REVOKED: [409, "This card was removed. Please add it again."],
+          CARD_EXPIRED: [409, "This card has expired."],
+          CHARGE_DECLINED: [
+            402,
+            "Your card was declined. Try another card or contact your bank.",
+          ],
+          CHARGE_RATE_LIMITED: [
+            429,
+            "Too many payments with this card. Please try again later.",
+          ],
+        };
+        const [status, message] = byCode[charge.code] || [
+          502,
+          "Could not start the payment. Please try again.",
+        ];
+        if (!byCode[charge.code])
+          console.error("Saved card charge error:", charge.code, charge.error);
+        return res
+          .status(status)
+          .json({ success: false, code: charge.code, message });
+      }
+
+      res.json({
+        success: true,
+        reference: charge.reference,
+        status: charge.status,
+        checkoutUrl: charge.checkoutUrl, // present only if the provider needs the customer to authenticate
+      });
+    } catch (error) {
+      console.error("Fund with saved card error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to start payment" });
+    }
+  },
+);
 
 // Get user funding requests
 app.get("/api/wallet/funding-requests", authMiddleware, async (req, res) => {
@@ -3426,7 +4215,7 @@ app.get("/api/wallet/funding-requests", authMiddleware, async (req, res) => {
       .select(
         `
                 *,
-                card:payment_cards(card_number, card_holder_name, card_type)
+                card:payment_cards(last4, card_holder_name, card_type)
             `,
       )
       .eq("user_id", req.userId)
@@ -3441,13 +4230,14 @@ app.get("/api/wallet/funding-requests", authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
-    // Mask card numbers
     const maskedRequests = (requests || []).map((req) => ({
       ...req,
       card: req.card
         ? {
             ...req.card,
-            card_number: req.card.card_number.replace(/\d(?=\d{4})/g, "*"),
+            card_number: req.card.last4
+              ? `**** **** **** ${req.card.last4}`
+              : "****",
           }
         : null,
     }));
@@ -3520,31 +4310,53 @@ app.post(
   authMiddleware,
   adminMiddleware,
   async (req, res) => {
-    const { data: result, error } = await supabase.rpc("transition_order_status", {
-      p_order_id: req.params.id,
-      p_new_status: "REFUND_PENDING",
-      p_actor_type: "admin",
-      p_actor_id: req.userId,
-      p_reason: req.body.reason || null,
-    });
-    if (error) return res.status(500).json({ success: false, message: "Failed to approve cancellation" });
-    if (!result.success) return res.status(result.code === "ORDER_NOT_FOUND" ? 404 : 400).json(result);
+    const { data: result, error } = await supabase.rpc(
+      "transition_order_status",
+      {
+        p_order_id: req.params.id,
+        p_new_status: "REFUND_PENDING",
+        p_actor_type: "admin",
+        p_actor_id: req.userId,
+        p_reason: req.body.reason || null,
+      },
+    );
+    if (error)
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to approve cancellation" });
+    if (!result.success)
+      return res
+        .status(result.code === "ORDER_NOT_FOUND" ? 404 : 400)
+        .json(result);
 
     // Immediately execute the refund — for a wallet (instant, atomic)
     // this doesn't need to be a separate manual step; REFUND_PENDING
     // existing as its own audited transition above is what matters,
     // not making an admin click twice for something synchronous.
-    const { data: refundResult, error: refundErr } = await supabase.rpc("refund_order", {
-      p_order_id: req.params.id,
-      p_actor_type: "admin",
-      p_actor_id: req.userId,
-      p_reason: req.body.reason || "Cancellation approved",
-    });
+    const { data: refundResult, error: refundErr } = await supabase.rpc(
+      "refund_order",
+      {
+        p_order_id: req.params.id,
+        p_actor_type: "admin",
+        p_actor_id: req.userId,
+        p_reason: req.body.reason || "Cancellation approved",
+      },
+    );
     if (refundErr) {
       console.error("refund_order RPC error:", refundErr);
-      return res.status(500).json({ success: false, message: "Cancellation approved but refund failed — order is now REFUND_PENDING, needs manual attention" });
+      return res
+        .status(500)
+        .json({
+          success: false,
+          message:
+            "Cancellation approved but refund failed — order is now REFUND_PENDING, needs manual attention",
+        });
     }
-    res.json({ success: true, message: "Cancellation approved and refunded", ...refundResult });
+    res.json({
+      success: true,
+      message: "Cancellation approved and refunded",
+      ...refundResult,
+    });
   },
 );
 
@@ -3557,15 +4369,24 @@ app.post(
   adminMiddleware,
   async (req, res) => {
     const { resume_status } = req.body; // e.g. "PREPARING" — whatever it actually was before
-    const { data: result, error } = await supabase.rpc("transition_order_status", {
-      p_order_id: req.params.id,
-      p_new_status: resume_status || "CONFIRMED",
-      p_actor_type: "admin",
-      p_actor_id: req.userId,
-      p_reason: req.body.reason || "Cancellation rejected",
-    });
-    if (error) return res.status(500).json({ success: false, message: "Failed to reject cancellation" });
-    if (!result.success) return res.status(result.code === "ORDER_NOT_FOUND" ? 404 : 400).json(result);
+    const { data: result, error } = await supabase.rpc(
+      "transition_order_status",
+      {
+        p_order_id: req.params.id,
+        p_new_status: resume_status || "CONFIRMED",
+        p_actor_type: "admin",
+        p_actor_id: req.userId,
+        p_reason: req.body.reason || "Cancellation rejected",
+      },
+    );
+    if (error)
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to reject cancellation" });
+    if (!result.success)
+      return res
+        .status(result.code === "ORDER_NOT_FOUND" ? 404 : 400)
+        .json(result);
     res.json({ success: true, message: "Cancellation rejected", ...result });
   },
 );
@@ -3593,7 +4414,7 @@ app.get(
             balance
           ),
           card:payment_cards(
-            card_number, 
+            last4, 
             card_holder_name, 
             card_type
           ),
@@ -3626,7 +4447,7 @@ app.get(
         return res.status(500).json({
           success: false,
           message: "Failed to fetch funding requests",
-          error: error.message,
+          error: publicError(error),
         });
       }
 
@@ -3653,9 +4474,9 @@ app.get(
         if (requestCopy.card) {
           requestCopy.card = {
             ...requestCopy.card,
-            card_number: requestCopy.card.card_number
-              ? requestCopy.card.card_number.replace(/\d(?=\d{4})/g, "*")
-              : null,
+            card_number: requestCopy.card.last4
+              ? `**** **** **** ${requestCopy.card.last4}`
+              : "****",
           };
         }
 
@@ -3674,102 +4495,150 @@ app.get(
       res.status(500).json({
         success: false,
         message: "Failed to fetch funding requests",
-        error: error.message,
+        error: publicError(error),
       });
     }
   },
 );
 
 // GET /api/admin/jobs?status=dead_letter&job_type=send_order_confirmation_email&limit=50&offset=0
-app.get("/api/admin/jobs", authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    const { status, job_type, limit, offset } = req.query;
-    let query = supabase
-      .from("background_jobs")
-      .select("*", { count: "exact" })
-      .order("created_at", { ascending: false })
-      .range(Number(offset) || 0, (Number(offset) || 0) + (Math.min(Number(limit) || 50, 200) - 1));
+app.get(
+  "/api/admin/jobs",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { status, job_type, limit, offset } = req.query;
+      let query = supabase
+        .from("background_jobs")
+        .select("*", { count: "exact" })
+        .order("created_at", { ascending: false })
+        .range(
+          Number(offset) || 0,
+          (Number(offset) || 0) + (Math.min(Number(limit) || 50, 200) - 1),
+        );
 
-    if (status) query = query.eq("status", status);
-    if (job_type) query = query.eq("job_type", job_type);
+      if (status) query = query.eq("status", status);
+      if (job_type) query = query.eq("job_type", job_type);
 
-    const { data, error, count } = await query;
-    if (error) throw error;
-    res.json({ success: true, jobs: data, total: count });
-  } catch (error) {
-    console.error("List jobs error:", error);
-    res.status(500).json({ success: false, message: "Failed to load jobs" });
-  }
-});
+      const { data, error, count } = await query;
+      if (error) throw error;
+      res.json({ success: true, jobs: data, total: count });
+    } catch (error) {
+      console.error("List jobs error:", error);
+      res.status(500).json({ success: false, message: "Failed to load jobs" });
+    }
+  },
+);
 
 // GET /api/admin/jobs/summary — counts per status, for a dashboard tile
-app.get("/api/admin/jobs/summary", authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from("background_jobs").select("status");
-    if (error) throw error;
-    const summary = data.reduce((acc, j) => {
-      acc[j.status] = (acc[j.status] || 0) + 1;
-      return acc;
-    }, {});
-    res.json({ success: true, summary });
-  } catch (error) {
-    console.error("Job summary error:", error);
-    res.status(500).json({ success: false, message: "Failed to load job summary" });
-  }
-});
+app.get(
+  "/api/admin/jobs/summary",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from("background_jobs")
+        .select("status");
+      if (error) throw error;
+      const summary = data.reduce((acc, j) => {
+        acc[j.status] = (acc[j.status] || 0) + 1;
+        return acc;
+      }, {});
+      res.json({ success: true, summary });
+    } catch (error) {
+      console.error("Job summary error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to load job summary" });
+    }
+  },
+);
 
 // POST /api/admin/jobs/:id/retry — resets to pending with a fresh
 // attempt budget. Safe: none of today's job types touch money
 // (notifications only) — see frozyla-job-worker.js's JOB_HANDLERS.
 // If a future job type DOES move money, that job type should not be
 // retryable through this generic endpoint without its own review.
-app.post("/api/admin/jobs/:id/retry", authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    const { data: job, error: fetchErr } = await supabase
-      .from("background_jobs")
-      .select("id, status")
-      .eq("id", req.params.id)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
-    if (job.status === "completed") {
-      return res.status(400).json({ success: false, message: "Job already completed — nothing to retry" });
-    }
+app.post(
+  "/api/admin/jobs/:id/retry",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { data: job, error: fetchErr } = await supabase
+        .from("background_jobs")
+        .select("id, status")
+        .eq("id", req.params.id)
+        .maybeSingle();
+      if (fetchErr) throw fetchErr;
+      if (!job)
+        return res
+          .status(404)
+          .json({ success: false, message: "Job not found" });
+      if (job.status === "completed") {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: "Job already completed — nothing to retry",
+          });
+      }
 
-    const { data, error } = await supabase
-      .from("background_jobs")
-      .update({ status: "pending", attempt_count: 0, next_retry_at: new Date().toISOString(), last_error: null, updated_at: new Date().toISOString() })
-      .eq("id", req.params.id)
-      .select()
-      .single();
-    if (error) throw error;
-    res.json({ success: true, message: "Job requeued", job: data });
-  } catch (error) {
-    console.error("Retry job error:", error);
-    res.status(500).json({ success: false, message: "Failed to retry job" });
-  }
-});
+      const { data, error } = await supabase
+        .from("background_jobs")
+        .update({
+          status: "pending",
+          attempt_count: 0,
+          next_retry_at: new Date().toISOString(),
+          last_error: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", req.params.id)
+        .select()
+        .single();
+      if (error) throw error;
+      res.json({ success: true, message: "Job requeued", job: data });
+    } catch (error) {
+      console.error("Retry job error:", error);
+      res.status(500).json({ success: false, message: "Failed to retry job" });
+    }
+  },
+);
 
 // POST /api/admin/jobs/:id/cancel — marks dead_letter/retrying job as
 // permanently failed, no further attempts. "cancel where safe" per
 // spec section 16 — safe here for the same reason retry is: no money
 // involved in any job type that exists today.
-app.post("/api/admin/jobs/:id/cancel", authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("background_jobs")
-      .update({ status: "failed", last_error: req.body.reason || "Cancelled by admin", updated_at: new Date().toISOString() })
-      .eq("id", req.params.id)
-      .select()
-      .single();
-    if (error) throw error;
-    if (!data) return res.status(404).json({ success: false, message: "Job not found" });
-    res.json({ success: true, message: "Job cancelled", job: data });
-  } catch (error) {
-    console.error("Cancel job error:", error);
-    res.status(500).json({ success: false, message: "Failed to cancel job" });
-  }
-});
+app.post(
+  "/api/admin/jobs/:id/cancel",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from("background_jobs")
+        .update({
+          status: "failed",
+          last_error: req.body.reason || "Cancelled by admin",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", req.params.id)
+        .select()
+        .single();
+      if (error) throw error;
+      if (!data)
+        return res
+          .status(404)
+          .json({ success: false, message: "Job not found" });
+      res.json({ success: true, message: "Job cancelled", job: data });
+    } catch (error) {
+      console.error("Cancel job error:", error);
+      res.status(500).json({ success: false, message: "Failed to cancel job" });
+    }
+  },
+);
 
 // ------------------------------------------------------------
 // Refund / reconciliation queue — orders needing a human decision
@@ -3779,52 +4648,81 @@ app.post("/api/admin/jobs/:id/cancel", authMiddleware, adminMiddleware, async (r
 // state that needs an admin action to move forward. One endpoint
 // covers all four "needs a human" states rather than four separate
 // queue views.
-app.get("/api/admin/orders/attention-queue", authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("orders")
-      .select("id, user_id, total, status, payment_status, created_at, updated_at")
-      .in("status", ["CANCELLATION_PENDING", "REFUND_PENDING", "FULFILLMENT_FAILED", "RECONCILIATION_REQUIRED"])
-      .order("updated_at", { ascending: true }); // oldest-waiting first
-    if (error) throw error;
+app.get(
+  "/api/admin/orders/attention-queue",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from("orders")
+        .select(
+          "id, user_id, total, status, payment_status, created_at, updated_at",
+        )
+        .in("status", [
+          "CANCELLATION_PENDING",
+          "REFUND_PENDING",
+          "FULFILLMENT_FAILED",
+          "RECONCILIATION_REQUIRED",
+        ])
+        .order("updated_at", { ascending: true }); // oldest-waiting first
+      if (error) throw error;
 
-    const byStatus = data.reduce((acc, o) => {
-      (acc[o.status] = acc[o.status] || []).push(o);
-      return acc;
-    }, {});
-    res.json({ success: true, total: data.length, by_status: byStatus, orders: data });
-  } catch (error) {
-    console.error("Attention queue error:", error);
-    res.status(500).json({ success: false, message: "Failed to load attention queue" });
-  }
-});
+      const byStatus = data.reduce((acc, o) => {
+        (acc[o.status] = acc[o.status] || []).push(o);
+        return acc;
+      }, {});
+      res.json({
+        success: true,
+        total: data.length,
+        by_status: byStatus,
+        orders: data,
+      });
+    } catch (error) {
+      console.error("Attention queue error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to load attention queue" });
+    }
+  },
+);
 
 // GET /api/admin/orders/:id/history — full audit trail for one order,
 // the transition-by-transition record transition_order_status() has
 // been writing since Phase 3.
-app.get("/api/admin/orders/:id/history", authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    const { data: order, error: orderErr } = await supabase
-      .from("orders")
-      .select("*")
-      .eq("id", req.params.id)
-      .maybeSingle();
-    if (orderErr) throw orderErr;
-    if (!order) return res.status(404).json({ success: false, message: "Order not found" });
+app.get(
+  "/api/admin/orders/:id/history",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { data: order, error: orderErr } = await supabase
+        .from("orders")
+        .select("*")
+        .eq("id", req.params.id)
+        .maybeSingle();
+      if (orderErr) throw orderErr;
+      if (!order)
+        return res
+          .status(404)
+          .json({ success: false, message: "Order not found" });
 
-    const { data: transitions, error: transErr } = await supabase
-      .from("order_status_transitions")
-      .select("*")
-      .eq("order_id", req.params.id)
-      .order("created_at", { ascending: true });
-    if (transErr) throw transErr;
+      const { data: transitions, error: transErr } = await supabase
+        .from("order_status_transitions")
+        .select("*")
+        .eq("order_id", req.params.id)
+        .order("created_at", { ascending: true });
+      if (transErr) throw transErr;
 
-    res.json({ success: true, order, transitions });
-  } catch (error) {
-    console.error("Order history error:", error);
-    res.status(500).json({ success: false, message: "Failed to load order history" });
-  }
-});
+      res.json({ success: true, order, transitions });
+    } catch (error) {
+      console.error("Order history error:", error);
+      res
+        .status(500)
+        .json({ success: false, message: "Failed to load order history" });
+    }
+  },
+);
 
 // Approve funding request (admin)
 app.patch(
@@ -3836,19 +4734,28 @@ app.patch(
       const { id } = req.params;
       const { admin_notes } = req.body;
 
-      const { data: result, error } = await supabase.rpc("approve_card_funding_request", {
-        p_funding_request_id: id,
-        p_admin_id: req.userId,
-        p_admin_notes: admin_notes || null,
-      });
+      const { data: result, error } = await supabase.rpc(
+        "approve_card_funding_request",
+        {
+          p_funding_request_id: id,
+          p_admin_id: req.userId,
+          p_admin_notes: admin_notes || null,
+        },
+      );
 
       if (error) {
         console.error("approve_card_funding_request RPC error:", error);
-        return res.status(500).json({ success: false, message: "Failed to approve funding" });
+        return res
+          .status(500)
+          .json({ success: false, message: "Failed to approve funding" });
       }
 
       if (!result.success) {
-        const statusByCode = { NOT_FOUND: 404, ALREADY_PROCESSED: 400, USER_NOT_FOUND: 404 };
+        const statusByCode = {
+          NOT_FOUND: 404,
+          ALREADY_PROCESSED: 400,
+          USER_NOT_FOUND: 404,
+        };
         return res.status(statusByCode[result.code] || 500).json({
           success: false,
           message: result.message || "Could not approve funding request",
@@ -3867,7 +4774,7 @@ app.patch(
       console.error("Approve funding error:", error);
       res.status(500).json({
         success: false,
-        message: error.message || "Failed to approve funding",
+        message: publicErrorMessage(error, "Failed to approve funding"),
       });
     }
   },
@@ -4206,7 +5113,7 @@ async function getFrozylaAccountId() {
                 return res.status(500).json({
                     success: false,
                     message: "Failed to fetch ledger entries",
-                    error: error.message,
+                    error: publicError(error),
                 });
             }
 
@@ -4298,7 +5205,7 @@ async function getFrozylaAccountId() {
             res.status(500).json({
                 success: false,
                 message: "Failed to fetch ledger entries",
-                error: error.message,
+                error: publicError(error),
             });
         }
     },
@@ -4390,7 +5297,7 @@ app.get(
         return res.status(500).json({
           success: false,
           message: "Failed to fetch ledger report",
-          error: error.message,
+          error: publicError(error),
         });
       }
 
@@ -4453,7 +5360,7 @@ app.get(
       res.status(500).json({
         success: false,
         message: "Failed to fetch ledger report",
-        error: error.message,
+        error: publicError(error),
       });
     }
   },
@@ -4530,7 +5437,7 @@ app.get(
       res.status(500).json({
         success: false,
         message: "Failed to fetch account balance",
-        error: error.message,
+        error: publicError(error),
       });
     }
   },
@@ -4624,7 +5531,7 @@ app.get(
         return res.status(500).json({
           success: false,
           message: "Failed to fetch transactions",
-          error: error.message,
+          error: publicError(error),
         });
       }
 
@@ -4745,12 +5652,11 @@ app.get(
       res.status(500).json({
         success: false,
         message: "Failed to fetch transactions",
-        error: error.message,
+        error: publicError(error),
       });
     }
   },
 );
-
 
 // Get ledger stats (admin only)
 app.get(
@@ -4817,13 +5723,11 @@ app.get(
       res.status(500).json({
         success: false,
         message: "Failed to fetch ledger stats",
-        error: error.message,
+        error: publicError(error),
       });
     }
   },
 );
-
-
 
 // Get all notifications (user)
 app.get("/api/notifications", authMiddleware, async (req, res) => {
@@ -4988,7 +5892,7 @@ app.patch(
 
         if (error) {
           console.error(`Failed to update setting ${key}:`, error);
-          results.push({ key, success: false, error: error.message });
+          results.push({ key, success: false, error: publicError(error) });
         } else {
           results.push({ key, success: true, data });
         }

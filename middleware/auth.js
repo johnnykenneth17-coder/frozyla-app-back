@@ -4,28 +4,96 @@
 
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
+const emailService = require("../lib/email-service");
 const { createClient } = require("@supabase/supabase-js");
 
 // Initialize Supabase with service key for admin operations
+// SECURITY (F-01 / audit item 9): fail closed. The server must never start
+// with a guessable JWT secret, and must never silently fall back to the
+// public anon key (that would hide a misconfiguration and bypass the
+// service-role model the whole backend is written for).
+if (!process.env.SUPABASE_SERVICE_KEY) {
+  throw new Error("SUPABASE_SERVICE_KEY is not set. Refusing to start.");
+}
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY,
+  process.env.SUPABASE_SERVICE_KEY,
 );
 
-const JWT_SECRET =
-  process.env.JWT_SECRET || "frozyla_super_secret_key_change_in_production";
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || /change[_-]?(me|in[_-]?production)/i.test(JWT_SECRET)) {
+  throw new Error(
+    "JWT_SECRET is missing or is a placeholder value. Set a long random secret (>= 32 chars) in the environment. Refusing to start.",
+  );
+}
+if (JWT_SECRET.length < 32) {
+  console.error(
+    "[AUTH] WARNING: JWT_SECRET is shorter than 32 characters. Rotate it to a long random value.",
+  );
+}
 
 // ===== JWT HELPERS =====
-function generateToken(userId, email, role = "user") {
-  return jwt.sign({ userId, email, role }, JWT_SECRET, { expiresIn: "7d" });
+// `tv` is the user's token_version at issue time. Changing/resetting a password increments the stored
+// version, so every older token (including refresh) stops working; see authMiddleware.
+function generateToken(userId, email, role = "user", tokenVersion = 0) {
+  return jwt.sign({ userId, email, role, tv: tokenVersion }, JWT_SECRET, { expiresIn: "7d" });
 }
 
 function verifyToken(token) {
   try {
-    return jwt.verify(token, JWT_SECRET);
+    // Pin the algorithm so a token can never be accepted under a different one.
+    return jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
   } catch (error) {
     return null;
   }
+}
+
+// ===== ACCOUNT STATE (authoritative, short-lived cache) =====
+// A signed JWT only proves who the caller WAS when the token was issued. The
+// role and account status are re-read from the database (cached briefly, so
+// the 5s polling does not become one query per request) which means:
+//   - a demoted admin loses access within CACHE_TTL, not after 7 days
+//   - a blocked/deleted account stops working immediately after the TTL
+const ACCOUNT_CACHE_TTL_MS = 15000;
+const ACCOUNT_CACHE_MAX = 5000;
+const accountCache = new Map();
+
+async function getAccountState(userId) {
+  const hit = accountCache.get(userId);
+  if (hit && Date.now() - hit.at < ACCOUNT_CACHE_TTL_MS) return hit.value;
+
+  let { data, error } = await supabase
+    .from("users")
+    .select("id, role, account_status, token_version")
+    .eq("id", userId)
+    .maybeSingle();
+
+  // Deploy-order safety: if migration 003 has not been applied the column does not exist (SQLSTATE 42703).
+  // Fall back to the previous query instead of locking every user out; revocation simply is not active yet.
+  if (error && (error.code === "42703" || /token_version/.test(error.message || ""))) {
+    console.error("[AUTH] users.token_version missing: apply migrations/003_auth_recovery_legal.sql (session revocation inactive)");
+    ({ data, error } = await supabase.from("users").select("id, role, account_status").eq("id", userId).maybeSingle());
+  }
+
+  if (error) {
+    // Stale-on-error keeps a short DB blip from logging everyone out, but we
+    // never invent a state we have not seen.
+    if (hit) return hit.value;
+    throw error;
+  }
+
+  const value = data
+    ? { exists: true, role: data.role || "user", accountStatus: data.account_status || "active", tokenVersion: data.token_version || 0 }
+    : { exists: false };
+  if (accountCache.size >= ACCOUNT_CACHE_MAX) accountCache.clear();
+  accountCache.set(userId, { at: Date.now(), value });
+  return value;
+}
+
+function invalidateAccountCache(userId) {
+  if (userId) accountCache.delete(userId);
+  else accountCache.clear();
 }
 
 // ===== AUTH MIDDLEWARE =====
@@ -47,9 +115,56 @@ async function authMiddleware(req, res, next) {
     });
   }
 
+  let state;
+  try {
+    state = await getAccountState(decoded.userId);
+  } catch (err) {
+    console.error("[AUTH] account state lookup failed:", err.message);
+    return res.status(503).json({
+      success: false,
+      message: "Service temporarily unavailable. Please try again.",
+    });
+  }
+
+  if (!state.exists) {
+    return res.status(401).json({ success: false, message: "Unauthorized: Invalid token" });
+  }
+  if (state.accountStatus === "blocked") {
+    return res.status(403).json({
+      success: false,
+      code: "ACCOUNT_BLOCKED",
+      message: "Your account has been blocked. Please contact support.",
+    });
+  }
+
+  // Session revocation: a token issued before the last password change/reset carries an older version.
+  if ((decoded.tv || 0) !== state.tokenVersion) {
+    return res.status(401).json({
+      success: false,
+      code: "SESSION_REVOKED",
+      message: "Your session has ended. Please sign in again.",
+    });
+  }
+
   req.userId = decoded.userId;
   req.userEmail = decoded.email;
-  req.userRole = decoded.role || "user";
+  req.tokenVersion = state.tokenVersion;
+  req.userRole = state.role; // DB is authoritative, not the token claim
+  req.accountStatus = state.accountStatus;
+  next();
+}
+
+// Money-moving routes additionally refuse restricted ("suspended") accounts.
+// Reading history/profile and contacting support stay available so a
+// restricted customer can still see their balance and ask for help.
+function requireActiveAccount(req, res, next) {
+  if (req.accountStatus && req.accountStatus !== "active") {
+    return res.status(403).json({
+      success: false,
+      code: "ACCOUNT_RESTRICTED",
+      message: "This action is unavailable while your account is restricted. Please contact support.",
+    });
+  }
   next();
 }
 
@@ -74,6 +189,46 @@ function staffMiddleware(req, res, next) {
     });
   }
   next();
+}
+
+// ===== LOGIN BRUTE-FORCE PROTECTION (F-07) =====
+// A real bcrypt hash of a random string. Compared against when the account
+// does not exist (or has no passcode) so "unknown account" costs the same time
+// as "wrong password" and cannot be told apart by response time.
+const DUMMY_HASH = "$2b$12$wozmGrZsx6B3DANPqm8Z/OZF7mTD03Rox0m5hGp8n6HDnKCmpyqIW";
+
+function isLockedOut(user) {
+  return !!(user && user.locked_until && new Date(user.locked_until) > new Date());
+}
+
+const lockedResponse = (res) =>
+  res.status(429).json({
+    success: false,
+    code: "TOO_MANY_ATTEMPTS",
+    message: "Too many failed attempts. Please try again in a few minutes.",
+  });
+
+// Atomic increment lives in SQL (migrations/001_auth_lockout.sql). If the
+// migration has not been applied yet this logs and login keeps working
+// exactly as before (the IP rate limiter still applies).
+async function registerFailedLogin(userId) {
+  try {
+    const { error } = await supabase.rpc("register_failed_login", { p_user_id: userId });
+    if (error) console.error("[AUTH] register_failed_login unavailable:", error.message);
+  } catch (err) {
+    console.error("[AUTH] register_failed_login failed:", err.message);
+  }
+}
+
+async function clearFailedLogins(user) {
+  // Only when there is something to clear; separate from the normal last_login
+  // update so a missing column can never break a successful login.
+  if (!user.failed_login_attempts && !user.locked_until) return;
+  const { error } = await supabase
+    .from("users")
+    .update({ failed_login_attempts: 0, locked_until: null })
+    .eq("id", user.id);
+  if (error) console.error("[AUTH] could not clear failed-login counters:", error.message);
 }
 
 // ===== VALIDATION HELPERS =====
@@ -231,11 +386,31 @@ async function signupUser(req, res) {
     }
 
     // Check if user exists (email or phone)
-    const { data: existing, error: checkError } = await supabase
+    // Legal acceptance must be an explicit, affirmative act (a ticked box), never implied by opening a page.
+    // LEGAL_SIGNUP_ENFORCED=false lets already-published app builds (which cannot send the flag yet) keep
+    // creating accounts during rollout. Those customers are still asked to accept at their first checkout.
+    if (req.body.acceptedTerms !== true && process.env.LEGAL_SIGNUP_ENFORCED !== "false") {
+      return res.status(400).json({
+        success: false,
+        code: "LEGAL_ACCEPTANCE_REQUIRED",
+        message: "Please accept the Terms and Conditions and Privacy Policy to create an account.",
+      });
+    }
+
+    // Two plain .eq() lookups instead of one .or("email.eq.<input>,...") string:
+    // an email containing commas/parentheses could otherwise alter the filter.
+    const { data: byEmail, error: emailCheckError } = await supabase
       .from("users")
       .select("id, email, phone")
-      .or(`email.eq.${sanitizedEmail},phone.eq.${normalizedPhone}`)
+      .eq("email", sanitizedEmail)
       .maybeSingle();
+    const { data: byPhone, error: phoneCheckError } = await supabase
+      .from("users")
+      .select("id, email, phone")
+      .eq("phone", normalizedPhone)
+      .maybeSingle();
+    const checkError = emailCheckError || phoneCheckError; // unchanged behaviour: the UNIQUE constraints are the backstop
+    const existing = byEmail || byPhone;
 
     if (existing) {
       return res.status(409).json({
@@ -298,7 +473,9 @@ async function signupUser(req, res) {
     }
 
     // Generate token with role
-    const token = generateToken(userId, sanitizedEmail, "user");
+    if (req.body.acceptedTerms === true) await recordSignupAcceptance(userId, req.ip);
+
+    const token = generateToken(userId, sanitizedEmail, "user", 0);
 
     // Return success
     res.status(201).json({
@@ -330,7 +507,7 @@ async function loginUser(req, res) {
     const { email, password } = req.body;
 
     // Validate input presence
-    if (!email || !password) {
+    if (!email || !password || typeof email !== "string" || typeof password !== "string") {
       return res.status(400).json({
         success: false,
         message: "Email and password are required",
@@ -356,23 +533,36 @@ async function loginUser(req, res) {
       .single();
 
     if (error || !user) {
-      // Use generic message for security
+      // Burn the same bcrypt time as a wrong password (no timing oracle).
+      await bcrypt.compare(password, DUMMY_HASH);
       return res.status(401).json({
         success: false,
         message: "Invalid credentials",
       });
     }
 
+    if (isLockedOut(user)) return lockedResponse(res);
+
     // Verify password
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) {
       // Log failed attempt (for security monitoring)
       console.warn(`Failed login attempt for ${sanitizedEmail} from ${req.ip}`);
+      await registerFailedLogin(user.id);
       return res.status(401).json({
         success: false,
         message: "Invalid credentials",
       });
     }
+
+    if (user.account_status === "blocked") {
+      return res.status(403).json({
+        success: false,
+        code: "ACCOUNT_BLOCKED",
+        message: "Your account has been blocked. Please contact support.",
+      });
+    }
+    await clearFailedLogins(user);
 
     // Update last login
     await supabase
@@ -384,7 +574,7 @@ async function loginUser(req, res) {
       .eq("id", user.id);
 
     // Generate token with role
-    const token = generateToken(user.id, user.email, user.role || "user");
+    const token = generateToken(user.id, user.email, user.role || "user", user.token_version || 0);
 
     // Return success with role info
     res.json({
@@ -415,7 +605,7 @@ async function loginWithPasscode(req, res) {
   try {
     const { identifier, passcode } = req.body;
 
-    if (!identifier || !passcode) {
+    if (!identifier || !passcode || typeof identifier !== "string" || typeof passcode !== "string") {
       return res.status(400).json({
         success: false,
         message: "Email/phone number and passcode are required",
@@ -454,30 +644,39 @@ async function loginWithPasscode(req, res) {
 
     const { data: user, error } = await query.maybeSingle();
 
-    if (error || !user) {
+    // "No such account" and "account has no passcode" are deliberately
+    // indistinguishable from "wrong passcode": same status, same body, same
+    // bcrypt cost. (Previously a distinct 400 revealed which accounts exist.)
+    if (error || !user || !user.passcode_hash) {
+      await bcrypt.compare(passcode, DUMMY_HASH);
       return res.status(401).json({
         success: false,
         message: "Invalid credentials",
       });
     }
 
-    if (!user.passcode_hash) {
-      return res.status(400).json({
-        success: false,
-        message: "Passcode sign-in isn't set up for this account yet",
-      });
-    }
+    if (isLockedOut(user)) return lockedResponse(res);
 
     const validPasscode = await bcrypt.compare(passcode, user.passcode_hash);
     if (!validPasscode) {
       console.warn(
         `Failed passcode login attempt for ${trimmedIdentifier} from ${req.ip}`,
       );
+      await registerFailedLogin(user.id);
       return res.status(401).json({
         success: false,
         message: "Invalid credentials",
       });
     }
+
+    if (user.account_status === "blocked") {
+      return res.status(403).json({
+        success: false,
+        code: "ACCOUNT_BLOCKED",
+        message: "Your account has been blocked. Please contact support.",
+      });
+    }
+    await clearFailedLogins(user);
 
     await supabase
       .from("users")
@@ -487,7 +686,7 @@ async function loginWithPasscode(req, res) {
       })
       .eq("id", user.id);
 
-    const token = generateToken(user.id, user.email, user.role || "user");
+    const token = generateToken(user.id, user.email, user.role || "user", user.token_version || 0);
 
     res.json({
       success: true,
@@ -661,7 +860,7 @@ async function googleAuth(req, res) {
       })
       .eq("id", user.id);
 
-    const token = generateToken(user.id, user.email, user.role || "user");
+    const token = generateToken(user.id, user.email, user.role || "user", user.token_version || 0);
 
     res.json({
       success: true,
@@ -717,6 +916,126 @@ async function getProfile(req, res) {
   }
 }
 
+// ===== LEGAL ACCEPTANCE =====
+// Records acceptance of the CURRENT version of every document required at signup. The stored row
+// carries user, document, version, context and timestamp (migrations/003).
+async function recordSignupAcceptance(userId, ip) {
+  try {
+    const { data: missing, error } = await supabase.rpc("missing_legal_acceptances", { p_user_id: userId, p_context: "signup" });
+    if (error) throw error;
+    if (!missing || !missing.length) return;
+    const { data, error: recErr } = await supabase.rpc("record_legal_acceptance", {
+      p_user_id: userId, p_docs: missing.map((d) => ({ doc_type: d.doc_type, version: d.version })),
+      p_context: "signup", p_ip: ip || null,
+    });
+    if (recErr || !data || !data.success) throw recErr || new Error(data && data.code);
+  } catch (err) {
+    // The account exists and the user did tick the box; do not strand them, but make the gap loud.
+    console.error("[LEGAL] could not record signup acceptance:", err && err.message);
+  }
+}
+
+// Gate for money-moving routes: the customer must have accepted the CURRENT version of every
+// document required at checkout. 403 + the list of documents lets the app show a proper prompt.
+function requireLegalAcceptance(context = "checkout") {
+  return async (req, res, next) => {
+    try {
+      const { data, error } = await supabase.rpc("missing_legal_acceptances", { p_user_id: req.userId, p_context: context });
+      if (error) {
+        if (error.code === "42883" || error.code === "PGRST202") {
+          console.error("[LEGAL] missing_legal_acceptances not found: apply migrations/003 (gate inactive)");
+          return next();
+        }
+        throw error;
+      }
+      if (data && data.length) {
+        return res.status(403).json({
+          success: false, code: "LEGAL_ACCEPTANCE_REQUIRED",
+          message: "Please review and accept our updated policies to continue.", documents: data,
+        });
+      }
+      next();
+    } catch (err) {
+      console.error("[LEGAL] acceptance check failed:", err && err.message);
+      res.status(503).json({ success: false, message: "Service temporarily unavailable. Please try again." });
+    }
+  };
+}
+
+// ===== PASSWORD RECOVERY =====
+const RESET_TTL_MINUTES = 30;
+const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const GENERIC_RESET_RESPONSE = {
+  success: true,
+  message: "If an account exists for that email, we've sent password reset instructions.",
+};
+
+async function forgotPassword(req, res) {
+  try {
+    const email = req.body && req.body.email;
+    if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) || email.length > 254) {
+      return res.status(400).json({ success: false, message: "Please enter a valid email address." });
+    }
+    const startedAt = Date.now();
+    const raw = crypto.randomBytes(32).toString("base64url");   // 256-bit, unguessable
+    const { data, error } = await supabase.rpc("create_password_reset", {
+      p_email: email.trim(), p_token_hash: sha256(raw), p_ttl_minutes: RESET_TTL_MINUTES, p_ip: req.ip || null,
+    });
+    if (error) throw error;
+
+    if (data && data.created) {
+      const base = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
+      if (!base || !emailService.isConfigured()) {
+        console.error("[RECOVERY] FRONTEND_URL / Brevo not configured: reset email NOT sent");
+      } else {
+        const mail = emailService.passwordResetEmail({
+          name: data.name, ttlMinutes: RESET_TTL_MINUTES,
+          resetUrl: `${base}/reset-password.html?token=${encodeURIComponent(raw)}`,
+        });
+        const sent = await emailService.sendEmail({ to: data.email, name: data.name, ...mail });
+        if (!sent.ok) console.error(`[RECOVERY] reset email failed (${sent.code}) for user ${data.user_id}`);
+      }
+    } else {
+      // Even response time should not reveal whether the account exists: pad to roughly the cost of a send.
+      await sleep(Math.max(0, 350 - (Date.now() - startedAt)) + Math.floor(Math.random() * 150));
+    }
+    // IDENTICAL answer whether or not the address is registered, blocked, throttled, or delivery failed.
+    return res.json(GENERIC_RESET_RESPONSE);
+  } catch (err) {
+    console.error("[RECOVERY] forgot-password error:", err && err.message);
+    return res.json(GENERIC_RESET_RESPONSE);   // an internal failure must not become an account oracle either
+  }
+}
+
+async function resetPassword(req, res) {
+  try {
+    const { token, newPassword } = req.body || {};
+    if (typeof token !== "string" || token.length < 20 || token.length > 200 || typeof newPassword !== "string") {
+      return res.status(400).json({ success: false, code: "INVALID_OR_EXPIRED", message: "This reset link is invalid or has expired." });
+    }
+    if (!validatePassword(newPassword)) {
+      return res.status(400).json({
+        success: false, code: "WEAK_PASSWORD",
+        message: "Password must be at least 6 characters with uppercase, lowercase, and a number",
+      });
+    }
+    const hashed = await bcrypt.hash(newPassword, 12);
+    const { data, error } = await supabase.rpc("consume_password_reset", { p_token_hash: sha256(token), p_new_password_hash: hashed });
+    if (error) throw error;
+    if (!data || !data.success) {
+      return res.status(400).json({ success: false, code: "INVALID_OR_EXPIRED", message: "This reset link is invalid or has expired. Please request a new one." });
+    }
+    invalidateAccountCache(data.user_id);   // this instance sees the revocation immediately; others within the cache TTL
+    emailService.sendEmail({ to: data.email, name: data.name, ...emailService.passwordChangedEmail({ name: data.name }) })
+      .catch(() => {});   // confirmation is best-effort; the password HAS changed
+    return res.json({ success: true, message: "Your password has been updated. Please sign in with your new password." });
+  } catch (err) {
+    console.error("[RECOVERY] reset-password error:", err && err.message);
+    return res.status(500).json({ success: false, message: "Could not reset password. Please try again." });
+  }
+}
+
 async function changePassword(req, res) {
   try {
     const { currentPassword, newPassword } = req.body;
@@ -760,29 +1079,37 @@ async function changePassword(req, res) {
       });
     }
 
+    // Administrators are the highest-value accounts: stronger minimum, and no "change" to the same password.
+    if (req.userRole === "admin" && newPassword.length < 10) {
+      return res.status(400).json({ success: false, message: "Administrator passwords must be at least 10 characters." });
+    }
+    if (await bcrypt.compare(newPassword, user.password)) {
+      return res.status(400).json({ success: false, message: "Your new password must be different from the current one." });
+    }
+
     // Hash new password
     const hashedPassword = await bcrypt.hash(newPassword, 12);
 
-    // Update password
-    const { error: updateError } = await supabase
-      .from("users")
-      .update({
-        password: hashedPassword,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", req.userId);
+    // One atomic statement: sets the hash, bumps token_version (revoking every existing session)
+    // and voids any outstanding reset links.
+    const { data: newVersion, error: updateError } = await supabase.rpc("set_user_password", {
+      p_user_id: req.userId, p_new_password_hash: hashedPassword,
+    });
 
     if (updateError) {
-      console.error("Password update error:", updateError);
-      return res.status(500).json({
-        success: false,
-        message: "Failed to update password",
-      });
+      console.error("Password update error:", updateError.message);
+      return res.status(500).json({ success: false, message: "Failed to update password" });
     }
+    invalidateAccountCache(req.userId);
 
+    emailService.sendEmail({ to: user.email, name: user.name, ...emailService.passwordChangedEmail({ name: user.name }) })
+      .catch(() => {});
+
+    // The device that made the change stays signed in with a token at the NEW version.
     res.json({
       success: true,
-      message: "Password updated successfully",
+      message: "Password updated successfully. Other devices have been signed out.",
+      token: generateToken(user.id, user.email, user.role || "user", newVersion || 0),
     });
   } catch (error) {
     console.error("Change password error:", error);
@@ -795,7 +1122,7 @@ async function changePassword(req, res) {
 
 async function refreshToken(req, res) {
   try {
-    const newToken = generateToken(req.userId, req.userEmail, req.userRole);
+    const newToken = generateToken(req.userId, req.userEmail, req.userRole, req.tokenVersion || 0);
     res.json({
       success: true,
       token: newToken,
@@ -812,6 +1139,11 @@ async function refreshToken(req, res) {
 // Export all functions
 module.exports = {
   authMiddleware,
+  requireActiveAccount,
+  requireLegalAcceptance,
+  forgotPassword,
+  resetPassword,
+  invalidateAccountCache,
   adminMiddleware,
   staffMiddleware,
   signupUser,
